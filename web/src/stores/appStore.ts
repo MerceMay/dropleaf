@@ -1,0 +1,308 @@
+import { create } from 'zustand';
+import { DEFAULT_DISPLAY, DISPLAY_TOGGLES, LEGACY_STORAGE_KEYS } from '@/data/displayToggles.js';
+import { MODES_META } from '@/modes/meta';
+import { readLocationParam, type SenderDevice } from '@/lib/util';
+
+// ────────────────────────────────────────────────────────────────────────────
+// 从 web-vue3/src/store/app.js 移植。三处一次性迁移逻辑**原样保留**。
+// ────────────────────────────────────────────────────────────────────────────
+
+// 某个模式「没被用户单独配过」时的取值。老版本把三个开关存成三个全局 key，
+// 升级后必须保证「看起来完全没变」—— 所以有老值就用老值，没有才用出厂默认。只算一次。
+const INITIAL_DISPLAY: Record<string, boolean> = (() => {
+    const initial: Record<string, boolean> = { ...DEFAULT_DISPLAY };
+    for (const [key, storageKey] of Object.entries(LEGACY_STORAGE_KEYS) as [string, string][]) {
+        const stored = localStorage.getItem(storageKey);
+        if (stored !== null) {
+            initial[key] = stored === 'true';
+            localStorage.removeItem(storageKey); // 迁完就删，免得两处状态打架
+        }
+    }
+    return initial;
+})();
+
+/**
+ * 全屏输入框的**背景**不透明度（%，30–100）。
+ *
+ * ⚠️ 有下限 30：再低，输入的文字就会和背后的页面糊在一起 ——「自己写的东西始终看得清」
+ * 是这个功能的前提，不是可选项。默认 100 = 完全不透明，与加这个功能之前完全一样。
+ *
+ * ⚠️ 只作用于**面板底色**，不动文字/按钮的 opacity：目的是「透过面板看见背后的内容」，
+ * 不是「把整个窗口调淡」。
+ */
+export const FULLSCREEN_OPACITY_MIN = 30;
+export const FULLSCREEN_OPACITY_MAX = 100;
+const FULLSCREEN_OPACITY_DEFAULT = 100;
+
+function clampFullscreenOpacity(value: number): number {
+    return Math.min(FULLSCREEN_OPACITY_MAX, Math.max(FULLSCREEN_OPACITY_MIN, Math.round(value)));
+}
+
+function loadFullscreenOpacity(): number {
+    const stored = localStorage.getItem('fullscreenOpacity');
+    if (stored === null) return FULLSCREEN_OPACITY_DEFAULT;
+    const parsed = Number(stored);
+    if (!Number.isFinite(parsed)) return FULLSCREEN_OPACITY_DEFAULT;
+    return clampFullscreenOpacity(parsed);
+}
+
+function loadDisplayByMode(): Record<string, Record<string, boolean>> {
+    const raw = localStorage.getItem('displayByMode');
+    if (!raw) return {};
+    try {
+        const parsed = JSON.parse(raw) as Record<string, Record<string, boolean>>;
+        if (!parsed || typeof parsed !== 'object') return {};
+        // markdown 开关曾经只在 default 模式露面，便签等模式下存的 markdown:false 不可能是
+        // 用户亲手关的，只能是「拨别的开关时把旧默认值(false)顺手存进去」的陈旧值。
+        // 现在默认值已翻成 true，清掉这些陈旧 false 让新默认生效；只清一次（打版本戳）。
+        if (localStorage.getItem('displayByModeMigrated') !== '1') {
+            for (const [mode, cfg] of Object.entries(parsed)) {
+                if (mode !== 'default' && cfg && typeof cfg === 'object' && cfg.markdown === false) {
+                    delete cfg.markdown;
+                }
+            }
+            localStorage.setItem('displayByMode', JSON.stringify(parsed));
+            localStorage.setItem('displayByModeMigrated', '1');
+        }
+        return parsed;
+    } catch {
+        return {};
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// 类型
+// ────────────────────────────────────────────────────────────────────────────
+
+export type DarkMode = 'time' | 'prefer' | 'enable' | 'disable' | '';
+
+export interface AppConfig {
+    version: string;
+    server: { history: number; prefix: string; roomList: boolean; auth?: boolean };
+    text: { limit: number };
+    file: { expire: number; chunk: number; limit: number };
+    automation?: { enabled?: boolean };
+    /** 全局是否要求鉴权（服务端 `config` 事件里的顶层字段）。 */
+    auth?: boolean;
+}
+
+export interface ReceivedItem {
+    id: string;
+    /**
+     * 条目类型。⚠️★ **别拿它做 `=== 'file'` 判定**，用 `lib/util.ts` 的 `isFileEntry`。
+     *
+     * 这个字段有**两种来源**、取值不一样：
+     *   · WS `receive` / `update` 事件 → 入库时的类型，只会是 `text` / `file`；
+     *   · 历史接口（`/content`、`/content/latest`）→ `content_entry()` 发的 **MIME 派生**类型，
+     *     可能是 `image` / `audio` / `video` / `document` / `archive` / `file`。
+     * 所以 `=== 'file'` 会把所有图片/音视频当成文本，且**刷新前后表现不同**。
+     * 唯一可靠的判据是「是不是 `text`」——收在 `isFileEntry` 里，别再各写一份。
+     */
+    type: string;
+    content?: string;
+    name?: string;
+    size?: number;
+    timestamp?: number;
+    cache?: string;
+    expire?: number;
+    thumbnail?: string;
+    column?: string;
+    senderDevice?: SenderDevice;
+    senderIP?: string;
+    source?: string;
+    late?: boolean;
+    [key: string]: unknown;
+}
+
+export interface AppState {
+    dark: DarkMode;
+    config: AppConfig;
+    send: { text: string; files: File[] };
+    received: ReceivedItem[];
+    /** 菜单布局：`top` = 顶部横条，`side` = 左侧竖栏。 */
+    menuLayout: 'top' | 'side';
+    device: Array<{ id: string; type?: string; os?: string; browser?: string; name?: string }>;
+    displayByMode: Record<string, Record<string, boolean>>;
+    searchQuery: string;
+    composerPrimary: string;
+    fullscreenSendClose: boolean;
+    /** 全屏输入框的背景不透明度（30–100，%）。见 `FULLSCREEN_OPACITY_MIN` 的说明。 */
+    fullscreenOpacity: number;
+    uiMode: string;
+    embedded: boolean;
+
+    setSearchQuery: (value: string) => void;
+    setConfig: (config: AppConfig) => void;
+    toggleComposerPrimary: () => void;
+    toggleFullscreenSendClose: () => void;
+    setFullscreenOpacity: (value: number) => void;
+    setUiMode: (mode: string) => void;
+    setDisplayToggle: (key: string, value: boolean) => void;
+}
+
+export const useAppStore = create<AppState>((set, get) => ({
+    dark: (localStorage.getItem('darkmode') as DarkMode) || 'prefer',
+    config: {
+        version: '',
+        server: { history: 0, prefix: '', roomList: false },
+        text: { limit: 0 },
+        file: { expire: 0, chunk: 0, limit: 0 },
+    },
+    send: { text: '', files: [] },
+    received: [],
+    /**
+     * 菜单布局（2026-10-07）：`top` = 顶部横条（原样），`side` = 左侧竖栏。
+     *
+     * ⚠️★ 为什么放在 store 里而不是组件 state：它要**即时生效**（切一下整个界面就换布局），
+     * 而工具栏是**每个模式各自渲染**的（`<PageToolbar/>`）—— 走 props 的话每个模式都要传一遍。
+     * ⚠️ 持久化到 localStorage（键 `menuLayout`），与 `darkmode` / `displayByMode` 同一套规矩。
+     */
+    menuLayout: (localStorage.getItem('menuLayout') === 'side' ? 'side' : 'top') as 'top' | 'side',
+    device: [],
+    displayByMode: loadDisplayByMode(),
+    searchQuery: '',
+    composerPrimary: localStorage.getItem('composerPrimary') || 'text',
+    fullscreenSendClose: localStorage.getItem('fullscreenSendClose') !== null
+        ? localStorage.getItem('fullscreenSendClose') === 'true'
+        : true,
+    fullscreenOpacity: loadFullscreenOpacity(),
+    // 界面模式：**地址里的 `?mode=` 优先**，其次是上次用过的，最后是标准模式。
+    // 这样「一个 tab 一个模式」——每个 tab 有自己的地址，就互不干扰。
+    uiMode: readLocationParam('mode') || localStorage.getItem('uiMode') || 'default',
+    // 嵌入态（桌面端把网页版塞进 iframe 时带 `?embed=1`）。
+    embedded: readLocationParam('embed') === '1',
+
+    setSearchQuery: (value) => set({ searchQuery: String(value || '') }),
+
+    setConfig: (config) => set({ config }),
+
+    toggleComposerPrimary: () => {
+        const next = get().composerPrimary === 'files' ? 'text' : 'files';
+        set({ composerPrimary: next });
+        localStorage.setItem('composerPrimary', next);
+    },
+
+    toggleFullscreenSendClose: () => {
+        const next = !get().fullscreenSendClose;
+        set({ fullscreenSendClose: next });
+        localStorage.setItem('fullscreenSendClose', String(next));
+    },
+
+    // 与 `toggleFullscreenSendClose` 同一套写法：改 store 与落盘**同一拍**。
+    setFullscreenOpacity: (value) => {
+        const next = clampFullscreenOpacity(Number(value));
+        set({ fullscreenOpacity: next });
+        localStorage.setItem('fullscreenOpacity', String(next));
+    },
+
+    setUiMode: (mode) => {
+        // 搜索条只存在于标准模式；不清掉的话，切到别的模式会看到一份被悄悄过滤过的列表，
+        // 而那个模式里根本没有搜索框可以清。
+        set({ uiMode: mode, searchQuery: '' });
+        localStorage.setItem('uiMode', mode);
+    },
+
+    // 拨动的是**当前模式**的开关。持久化写在 action 里（跟 uiMode / composerPrimary 同一写法）。
+    setDisplayToggle: (key, value) => {
+        const state = get();
+        const next = {
+            ...state.displayByMode,
+            [state.uiMode]: { ...selectDisplay(state), [key]: value },
+        };
+        set({ displayByMode: next });
+        localStorage.setItem('displayByMode', JSON.stringify(next));
+    },
+}));
+
+// ────────────────────────────────────────────────────────────────────────────
+// 选择器（对应 Pinia 的 getters）—— 不进 store，避免全量订阅重渲染
+// ────────────────────────────────────────────────────────────────────────────
+
+/**
+ * 搜索过滤后的内容列表。**各模式渲染列表都取这个，不要直接取 received** ——
+ * 否则搜索框只在部分模式生效，看着像坏了。
+ * 计数、空态判断仍然用 received（那是「房间里有多少内容」，与搜索无关）。
+ */
+export function selectVisibleReceived(state: Pick<AppState, 'searchQuery' | 'received'>): ReceivedItem[] {
+    const q = String(state.searchQuery || '').trim().toLowerCase();
+    if (!q) return state.received;
+    return state.received.filter((item) => {
+        const haystack = item.type === 'text' ? String(item.content || '') : String(item.name || '');
+        return haystack.toLowerCase().includes(q);
+    });
+}
+
+/**
+ * 当前模式的显示开关。缺的键用 INITIAL_DISPLAY 兜底 —— 加新开关时老用户不用迁移就能拿到默认值。
+ *
+ * ⚠️★ 嵌入态（`?embed=1`）：composer 那一组**没被用户拨过就当关** —— 「桌面端帮忙关一下」，
+ * 但**允许手动打开**（用户在个性化里拨过的照旧算数）。为什么在源头改**默认值**而不是各模式
+ * 各判一遍 `embedded`：发送区有两套实现，在源头改两边自动都吃到。
+ */
+/**
+ * 换菜单布局。⚠️ 写 localStorage 与改 store **同一拍**（与 `setPrimary` 一致）：
+ * 界面立刻换，刷新之后还是这个选择。
+ */
+export function setMenuLayout(layout: 'top' | 'side'): void {
+    localStorage.setItem('menuLayout', layout);
+    useAppStore.setState({ menuLayout: layout });
+}
+
+export function selectDisplay(state: Pick<AppState, 'displayByMode' | 'uiMode' | 'embedded'>): Record<string, boolean> {
+    const stored = state.displayByMode[state.uiMode] || {};
+    const base: Record<string, boolean> = { ...INITIAL_DISPLAY, ...stored };
+    if (!state.embedded) {
+        return base;
+    }
+    const hostTakesInput: Record<string, boolean> = { ...base };
+    for (const toggle of DISPLAY_TOGGLES as Array<{ key: string; group: string }>) {
+        if (toggle.group === 'composer' && !(toggle.key in stored)) {
+            hostTakesInput[toggle.key] = false;
+        }
+    }
+    return hostTakesInput;
+}
+
+/**
+ * 输入区是不是**什么都不剩**了：文本区、上传区、以及 composer 那一整组图标全关。
+ * 这时候只剩一个空外框，该把整个输入区一起藏掉。
+ * ⚠️ 只是图标全关、输入框还在时**不该**藏 —— 框是输入框的容器。
+ */
+export function selectComposerFullyHidden(state: Pick<AppState, 'displayByMode' | 'uiMode' | 'embedded'>): boolean {
+    const d = selectDisplay(state);
+    if (d.composerText || d.composerUpload) return false;
+    const iconKeys = (DISPLAY_TOGGLES as Array<{ key: string; group: string }>)
+        .filter((x) => x.group === 'composer' && x.key !== 'composerText' && x.key !== 'composerUpload')
+        .map((x) => x.key);
+    return !iconKeys.some((k) => d[k]);
+}
+
+/**
+ * 所有模式**全都**把文本区与上传区关掉了 —— 即「纯预览模式」。
+ * ⚠️ 模式列表**现取**（不要在模块顶层算成常量）：见 meta.ts 的循环依赖说明。
+ */
+export function selectComposerDisabledEverywhere(state: Pick<AppState, 'displayByMode'>): boolean {
+    return MODES_META.map((m) => m.key).every((mode) => {
+        const cfg = state.displayByMode[mode] || {};
+        const off = (key: string) => (key in cfg ? cfg[key] : (DEFAULT_DISPLAY as Record<string, boolean>)[key]) === false;
+        return off('composerText') && off('composerUpload');
+    });
+}
+
+/** 深浅色策略解析成「现在是不是暗色」。 */
+export function selectUseDark(state: Pick<AppState, 'dark'>): boolean {
+    switch (state.dark) {
+        case 'time': {
+            const hour = new Date().getHours();
+            return hour < 7 || hour >= 19;
+        }
+        case 'prefer':
+            return window.matchMedia('(prefers-color-scheme: dark)').matches;
+        case 'enable':
+            return true;
+        case 'disable':
+            return false;
+        default:
+            return false;
+    }
+}

@@ -1,0 +1,519 @@
+import { Router } from 'itty-router';
+import { corsHeaders, handleCors, withCors } from './cors';
+import { canAccessRoom, resolveRoomAuth, issueRoomSessionToken, validateRoomSessionToken, parseRoomSessionToken, extractAuthToken, buildSessionCookie, SESSION_COOKIE_NAME, bumpSessionEpoch, getSessionEpoch, normalizeRoomName, SESSION_OK, EPOCH_UNAVAILABLE } from './auth';
+import { TextHandler } from './handlers/text';
+import { FileHandler } from './handlers/file';
+import { ContentHandler } from './handlers/content';
+import { DraftHandler } from './handlers/draft';
+import { WebSocketHandler } from './handlers/websocket';
+import { SHELL_BASE_HREF, injectShellTags, readShellHtml } from './spa-shell';
+import { errorResponse } from './errors';
+import { historyLimit } from './utils';
+import { sweepExpiredFiles } from './file-cleanup';
+
+// 导入 Durable Objects
+export { WebSocketRoom } from './durable-objects/websocket-room';
+
+const router = Router();
+
+function isRoomListEnabled(env) {
+  return ['1', 'true', 'yes', 'on'].includes(String(env.ROOM_LIST || '').toLowerCase());
+}
+
+// CORS 预检请求
+router.options('*', handleCors);
+
+// API 路由（无 /api 前缀，与自托管 Go 后端路径对齐）
+router.get('/server', handleServer);
+router.post('/auth/token', handleAuthToken);
+router.post('/auth/token/refresh', handleAuthTokenRefresh);
+// （退出登录路由在下面 `onlyPost` 定义之后注册 —— 箭头函数是 const，提前引用会 TDZ。）
+// DropLeaf：草稿实时同步 + 保存归档。单人剪贴板无多房间运营面：
+// /rooms、/stats/daily、/share* 已删（前端无调用方，见 PASTE-INVENTORY.md）。
+router.get('/draft', DraftHandler.get);
+router.put('/draft', DraftHandler.put);
+router.post('/save', DraftHandler.save);
+router.post('/text', TextHandler.create);
+router.get('/content/latest', ContentHandler.getLatest);
+// ⚠️ `/content`（**历史分页**，`?room=&before=&limit=`）必须和 `/content/:id` 并存：
+// itty-router 里 `:id` 不跨 `/`、也需要一段，所以 `/content` 不会被它抢走；
+// 但**两条都要在**，少一条的后果是历史整个取不到（`?history=0` 之后前端只会走这条）。
+router.get('/content', ContentHandler.contentList);
+router.get('/content/:id', ContentHandler.getById);
+// 看板：把卡片挪到某一列。`:id` 不跨 `/`，所以不会和上面两条抢。
+router.post('/content/:id/column', ContentHandler.setColumn);
+router.post('/upload/chunk', FileHandler.createChunk);
+router.post('/upload/chunk/:uuid', FileHandler.uploadChunkPart);
+router.post('/upload/finish/:uuid', FileHandler.finishChunk);
+router.post('/upload/multipart/create', FileHandler.createMultipart);
+router.put('/upload/multipart/:partNumber', FileHandler.uploadMultipartPart);
+router.post('/upload/multipart/complete', FileHandler.completeMultipart);
+router.delete('/upload/multipart', FileHandler.abortMultipart);
+router.post('/upload', FileHandler.upload);
+router.get('/file/:uuid/:filename?', FileHandler.download);
+router.delete('/file/:uuid', FileHandler.delete);
+
+// ── 删除消息：**只认 POST** ────────────────────────────────────────────────
+// ⚠️★ 2026-10-20：两个后端统一成 POST-only。
+//    · 自建服务端（Rust）只注册 POST（`post(handlers::revoke).fallback(only_post)`），
+//      理由：破坏性操作必须是**显式 POST** —— Go 那边不检查方法，浏览器打开 `/revoke/5`
+//      就能删掉 5 号条目。
+//    · 这里原来只有 DELETE，网页版改成 POST 之后两边对不上 → 现在只留 POST。
+//    · 其它方法回 **405 `method_not_allowed`**，不是让兜底回 404 `route_not_found`：
+//      Rust 那边就是这个形状（"Only POST is allowed" / "仅允许 POST 请求"），
+//      客户端靠码区分「方法不对」与「路由不存在」。
+//    ⚠️ 代价：**被 Service Worker 缓存的老页面**还会发 DELETE → 收到 405、看到「删除失败」。
+//       刷新一次拿到新 SW 就好。这是「只留 POST」的必然代价，不是 bug。
+const onlyPost = () =>
+  errorResponse(405, 'method_not_allowed', 'Only POST is allowed', '仅允许 POST 请求');
+router.post('/revoke/all', ContentHandler.revokeAll);
+router.all('/revoke/all', onlyPost);
+router.post('/revoke/:id', ContentHandler.revoke);
+router.all('/revoke/:id', onlyPost);
+// 退出登录：破坏性（把所有人的令牌一起作废），同样只认显式 POST。
+router.post('/auth/logout', handleAuthLogout);
+router.all('/auth/logout', onlyPost);
+
+// WebSocket 连接
+router.get('/push', WebSocketHandler.connect);
+
+// 健康检查
+router.get('/health', () => new Response('OK'));
+// ⚠️ 自建服务端那条叫 `/healthz`（`rust/crates/server/src/lib.rs`）—— 两边名字不一样的话，
+// 任何「先探活再连」的脚本/监控都要为两个后端各写一份。补一个别名，两边都认。
+router.get('/healthz', () => new Response('OK'));
+
+// 兜底路由：资源层没命中、上面也没命中时走这里。
+//
+// 为什么兜底要放在 Worker 而不是资源层（not_found_handling = "single-page-application"）：
+// 资源层的 SPA 回退只认「导航请求」，而浏览器点下载链接、打开分享链接正好就是导航请求，
+// 于是 /file/<uuid>/<name> 会被回成 index.html，文件下载就变成了「下载到一个 html」。
+// 放在这里之后，导航请求和 XHR 走同一条路，不再有两套行为。
+router.all('*', handleFallback);
+
+// 房间会话令牌有效期：**7 天**（与自建服务端的 `ROOM_SESSION_TTL_SECONDS` 保持一致）。
+//
+// ⚠️★ 2026-10-26 从 1 小时改成 7 天：手机上的 PWA 被系统回收 / 被划掉之后，
+// 一小时的令牌早就过期了 —— 表现就是「每次打开都要重输密码」。
+// ⚠️ 吊销手段仍然在：令牌的签名密钥是从「全局密码 + 各房间密码」派生的，
+// **改一次密码 = 所有已签发的令牌当场作废**。这条是敢放长的前提，别把它改掉。
+const ROOM_SESSION_TTL = 7 * 24 * 60 * 60;
+
+// 兜底处理：GET/HEAD 回前端外壳，其余方法明确 404。
+//
+// ⚠️ **必须注入 `<base>`**：前端现在是 history 路由，任何深路径（`/foo/bar` 直接刷新或粘贴打开）
+// 都会走到这里拿到外壳；不注入的话外壳里的相对资源 `./assets/…` 会按 `/foo/assets/…` 解析，
+// 全部 404、页面白屏。Go 侧 `spaStaticHandler` 对同样的场景也注入了 base，两边必须一致。
+async function handleFallback(request, env) {
+  if (request.method !== 'GET' && request.method !== 'HEAD') {
+    return errorResponse(404, 'route_not_found', 'Not Found', '接口不存在');
+  }
+
+  const shell = await readShellHtml(env, request);
+  if (!shell) {
+    return errorResponse(404, 'assets_missing', 'Not Found', '前端资源未部署');
+  }
+
+  const page = injectShellTags(shell, { baseHref: SHELL_BASE_HREF });
+  if (!page) {
+    // 外壳形状出乎意料（缺 `<head>` / `</head>`）：宁可 404，也不吐一份半截 HTML。
+    return errorResponse(404, 'shell_malformed', 'Not Found', '前端外壳不可用');
+  }
+
+  return new Response(request.method === 'HEAD' ? null : page, {
+    status: 200,
+    headers: { 'Content-Type': 'text/html; charset=utf-8' },
+  });
+}
+
+// 处理 /auth/token 端点
+async function handleAuthToken(request, env) {
+  if (request.method !== 'POST') {
+    return errorResponse(405, 'method_not_allowed', 'Method Not Allowed', '方法不允许');
+  }
+
+  const url = new URL(request.url);
+  const room = url.searchParams.get('room') || 'default';
+
+  try {
+    const body = await request.json();
+    const password = String(body.password || '').trim();
+
+    if (!password) {
+      return errorResponse(401, 'password_required', 'Password required', '密码不能为空');
+    }
+
+    // ── 登录尝试限流（安全修复 2026-11-05）────────────────────────────────
+    // 按来源 IP 计数：15 分钟窗口内连续 5 次失败 → 429。成功登录清空该 IP 的计数。
+    // 表懒建（幂等 CREATE，与 deviceName/boardColumn 同一套自愈策略）。
+    const clientIp = request.headers.get('CF-Connecting-IP') || 'local';
+    if (env.DB) {
+      // **先占位再验密码**（复审 P2）：并发提交的错误密码各自先落一条记录，
+      // 第 6 个及以后的请求在占位时就看到超额 → 429，根本进不了密码校验。
+      const gate = await reserveAuthAttempt(env.DB, clientIp);
+      if (!gate.ok) {
+        if (gate.available === false) {
+          // 限流设施自身故障：503（可重试），不是 429、也不是放行。
+          return errorResponse(503, 'rate_limit_unavailable', 'Rate limiter unavailable, retry', '登录服务暂不可用，请稍后重试');
+        }
+        return errorResponse(429, 'too_many_attempts', 'Too many attempts', '尝试次数过多，请 15 分钟后再试');
+      }
+    }
+
+    if (!canAccessRoom(env, room, password)) {
+      // 名额已在上面占掉（占位记录即失败记录），这里只回 401。
+      return errorResponse(401, 'wrong_password', 'Wrong password', '密码不正确');
+    }
+
+    if (env.DB) {
+      await clearAuthFailures(env.DB, clientIp);
+    }
+
+    // 使用全局密码登录时，签发对所有房间有效的全局会话令牌
+    const globalPassword = String(env.AUTH_PASSWORD || '').trim();
+    const scope = globalPassword && password === globalPassword ? 'global' : '';
+
+    // ⚠️ 纪元读不出来时签不出可靠令牌（ver 写成什么都是错的）—— 503 可重试。
+    let token;
+    try {
+      token = await issueRoomSessionToken(env, room, ROOM_SESSION_TTL, scope);
+    } catch (error) {
+      console.error('签发令牌失败（纪元不可用）:', error);
+      return errorResponse(503, 'epoch_unavailable', 'Session state unavailable, retry', '会话状态暂不可用，请稍后重试');
+    }
+
+    // 会话 Cookie（HttpOnly）：同源部署下媒体预览（<img>/<video>）不带 URL 令牌即可通过鉴权
+    return new Response(JSON.stringify({
+      token,
+      expiresAt: Math.floor(Date.now() / 1000) + ROOM_SESSION_TTL,
+      scope,
+    }), {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/json',
+        'Set-Cookie': buildSessionCookie(token, { maxAgeSeconds: ROOM_SESSION_TTL, request }),
+        ...corsHeaders,
+      },
+    });
+  } catch (error) {
+    console.error('Error in handleAuthToken:', error);
+    return errorResponse(500, 'token_issue_failed', 'Failed to issue token', '令牌签发失败');
+  }
+}
+
+// ── 登录限流的 D1 实现 ────────────────────────────────────────────────────
+const AUTH_ATTEMPT_WINDOW_SECONDS = 15 * 60;
+const AUTH_ATTEMPT_MAX_FAILURES = 5;
+
+async function ensureAuthAttemptsTable(db) {
+  // 幂等自愈（列结构简单，直接 CREATE IF NOT EXISTS；失败只影响限流不影响登录）
+  try {
+    await db
+      .prepare('CREATE TABLE IF NOT EXISTS auth_attempts (ip TEXT NOT NULL, ts INTEGER NOT NULL)')
+      .run();
+  } catch {
+    /* 建表失败（如只读）时跳过限流 */
+  }
+}
+
+/**
+ * 占一个登录尝试名额（第二轮复审 P2 修正）。
+ *
+ * 语义：窗口内**最多 MAX 条记录**；只有记录数 < 上限时才插入自己这一条，
+ * 满额的请求**不新增记录**直接被拒 —— 重试不能延长锁定，到点自然恢复。
+ * （并发下两条 COUNT-then-INSERT 可能同时通过判定、插到 MAX+1 条 ——
+ * 后续请求会看到超额并被拒，多插的一条在窗口滑动时清理，安全方向无碍。）
+ *
+ * 登录成功时 clearAuthFailures 清掉该 IP 的整段记录。
+ */
+async function reserveAuthAttempt(db, ip) {
+  await ensureAuthAttemptsTable(db);
+  try {
+    const now = Math.floor(Date.now() / 1000);
+    const cutoff = now - AUTH_ATTEMPT_WINDOW_SECONDS;
+
+    // 维护：清掉出窗的旧记录。删不删都不影响下面那条判定的正确性 ——
+    // 计数子查询自己带 ts 窗口条件。
+    await db.prepare('DELETE FROM auth_attempts WHERE ts < ?').bind(cutoff).run();
+
+    // ── 单条条件写入，原子分配名额（第二轮复审 P2）──────────────────────
+    // 旧实现「INSERT 后 COUNT」是两条语句，且**被拒的请求也留记录**：并发时
+    // 全部占位、且持续重试不断补充记录 → 锁定被无限延长。
+    // 现在：INSERT ... SELECT ... WHERE (窗口内计数 < 上限) —— 单条语句，
+    // SQLite 写操作串行执行，计数与插入之间不可能插进别的写；满额时**一行都不插**。
+    const result = await db.prepare(
+      `INSERT INTO auth_attempts (ip, ts)
+       SELECT ?, ?
+       WHERE (SELECT COUNT(*) FROM auth_attempts WHERE ip = ? AND ts >= ?) < ?`,
+    )
+      .bind(ip, now, ip, cutoff, AUTH_ATTEMPT_MAX_FAILURES)
+      .run();
+    const granted = Number(result?.meta?.changes ?? 0) > 0;
+    return { ok: granted, available: true };
+  } catch (error) {
+    // ⚠️★ 第三轮复审 P2：存储故障时**不能放行** —— 那等于在没有计数的情况下
+    // 继续校验密码，暴力破解的门槛消失。也不能当成 429（会误导用户以为被限流、
+    // 并把真实故障藏起来）。返回 available:false，由调用方给可重试的 503。
+    console.error('登录限流存储不可用:', error);
+    return { ok: false, available: false };
+  }
+}
+
+async function clearAuthFailures(db, ip) {
+  try {
+    await db.prepare('DELETE FROM auth_attempts WHERE ip = ?').bind(ip).run();
+  } catch { /* 清理失败不影响登录本身 */ }
+}
+
+// 处理 /auth/token/refresh 端点：使用仍有效的会话令牌续签，无需密码即可静默续期
+async function handleAuthTokenRefresh(request, env) {
+  if (request.method !== 'POST') {
+    return errorResponse(405, 'method_not_allowed', 'Method Not Allowed', '方法不允许');
+  }
+
+  const url = new URL(request.url);
+  const room = url.searchParams.get('room') || 'default';
+  // 续签同样只认显式令牌头/query（POST 不接受 Cookie，统一策略）
+  const token = extractAuthToken(request, { allowCookie: false });
+
+  const claims = await parseRoomSessionToken(env, token);
+  // ⚠️ 三态（第三轮复审 P1）：纪元读不出来时既不能续签（无法确认令牌没过期）
+  // 也不能 401（会把有效会话踢掉）—— 503 让客户端稍后重试。
+  const verdict = claims ? await validateRoomSessionToken(env, room, token) : null;
+  if (!claims || verdict === 'stale') {
+    return errorResponse(401, 'session_token_invalid', 'Session token invalid or expired', '会话令牌无效或已过期');
+  }
+  if (verdict === EPOCH_UNAVAILABLE) {
+    return errorResponse(503, 'epoch_unavailable', 'Session state unavailable, retry', '会话状态暂不可用，请稍后重试');
+  }
+
+  try {
+    // 续签时保留原令牌的 scope，避免全局会话降级为房间专属
+    const scope = claims.scope === 'global' ? 'global' : '';
+    // 同上：纪元不可用时不能续签。
+    let newToken;
+    try {
+      newToken = await issueRoomSessionToken(env, room, ROOM_SESSION_TTL, scope);
+    } catch (error) {
+      console.error('续签令牌失败（纪元不可用）:', error);
+      return errorResponse(503, 'epoch_unavailable', 'Session state unavailable, retry', '会话状态暂不可用，请稍后重试');
+    }
+    return new Response(JSON.stringify({
+      token: newToken,
+      expiresAt: Math.floor(Date.now() / 1000) + ROOM_SESSION_TTL,
+      scope,
+    }), {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/json',
+        'Set-Cookie': buildSessionCookie(newToken, { maxAgeSeconds: ROOM_SESSION_TTL, request }),
+        ...corsHeaders,
+      },
+    });
+  } catch (error) {
+    console.error('Error in handleAuthTokenRefresh:', error);
+    return errorResponse(500, 'token_refresh_failed', 'Failed to refresh token', '令牌续签失败');
+  }
+}
+// 处理 /auth/logout 端点：真正让会话失效。
+// ⚠️ 只清浏览器里的令牌**不算退出**（被抄走的那份还能用满 7 天），
+// 所以这里把会话纪元 +1 —— 所有旧令牌（含其它设备上的）一起作废。
+// 代价是「一台设备退出 = 全部设备退出」，对单人剪贴板正是想要的语义。
+//
+// ⚠️ 必须**先验证令牌**再抬纪元：否则任何人拿一串垃圾 POST 一次就能把主人
+// 踢下线（未授权的全局失效 = 拒绝服务）。
+async function handleAuthLogout(request, env) {
+  const url = new URL(request.url);
+  const room = url.searchParams.get('room') || 'default';
+  // 退出是写操作：不接受 Cookie（否则同站子域可用表单把主人退出登录）
+  const token = extractAuthToken(request, { allowCookie: false });
+
+  const clearCookie = buildSessionCookie('', { maxAgeSeconds: 0, request });
+  const respond = (status, payload) => new Response(JSON.stringify(payload), {
+    status,
+    headers: {
+      'Content-Type': 'application/json',
+      'Set-Cookie': clearCookie,
+      ...corsHeaders,
+    },
+  });
+
+  // ⚠️ 只解析**签名**（不比对纪元）：要区分「真实会话凭据」与「垃圾」。
+  // 签名不成立/已过期 → 只清 Cookie，既不抬纪元也不打扰 DO。
+  const claims = token ? await parseRoomSessionToken(env, token) : null;
+  if (!claims) {
+    return respond(200, { ok: true, revoked: false });
+  }
+
+  const tokenEpoch = Number(claims.ver);
+
+  try {
+    // ⚠️ 纪元读不出来 = 判不了「这张令牌是否仍有效」（第三轮复审 P1）：
+    // 走 catch 的 503 —— 与「通知 DO 失败」同一条重试路径。
+    const currentEpoch = await getSessionEpoch(env);
+    if (tokenEpoch === currentEpoch) {
+      // 有效会话：抬纪元 + 通知 DO 关闭旧连接。
+      const epoch = await bumpSessionEpoch(env);
+      console.log(`退出登录：会话纪元提升至 ${epoch}（room=${room}）`);
+      await revokeRoomSessions(env, room, epoch);
+      return respond(200, { ok: true, revoked: true });
+    }
+
+    // ⚠️★ 令牌已被**之前的**退出作废（tokenEpoch < 当前纪元）。
+    // 这是「上次通知 DO 失败 → 客户端重试」的补救路径：
+    //   · **不再抬纪元**（否则持有任意旧令牌的人都能反复全端踢人 = 拒绝服务）；
+    //   · 但按**当前**纪元重新通知 DO —— 关闭 ver < 当前纪元的连接。
+    //     当前纪元签发的令牌 ver === epoch，不会被误关，所以这个通知是幂等且安全的。
+    await revokeRoomSessions(env, room, currentEpoch);
+    return respond(200, { ok: true, revoked: false });
+  } catch (error) {
+    console.error('Error in handleAuthLogout:', error);
+    // ⚠️ 不能返回 200：客户端会认为退出完成，而旧 WS 还活着。
+    // 503：让 UI 明确重试（令牌此时已作废，重试走上面的补救分支再次通知 DO）。
+    const response = errorResponse(503, 'logout_incomplete', 'Logout incomplete, retry', '退出未完成，请重试');
+    response.headers.set('Retry-After', '2');
+    return response;
+  }
+}
+
+const REVOKE_SESSIONS_TIMEOUT_MS = 3000;
+
+async function revokeRoomSessions(env, room, epoch) {
+  if (!env.WEBSOCKET_ROOM) {
+    return;
+  }
+  const id = env.WEBSOCKET_ROOM.idFromName(normalizeRoomName(room));
+  const stub = env.WEBSOCKET_ROOM.get(id);
+  const request = stub.fetch(new Request('https://internal/revoke-sessions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ epoch }),
+  }));
+  // 超时也算失败：DO 卡死时 logout 不能挂起，也不能谎报成功。
+  const timeout = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error('DO revoke-sessions timed out')), REVOKE_SESSIONS_TIMEOUT_MS),
+  );
+  const response = await Promise.race([request, timeout]);
+  if (!response.ok) {
+    throw new Error(`DO revoke-sessions failed with ${response.status}`);
+  }
+}
+
+// 处理 /server 端点
+async function handleServer(request, env) {
+  const url = new URL(request.url);
+  const wsProtocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+  const requestedRoom = url.searchParams.has('room') ? url.searchParams.get('room') : null;
+  const globalPassword = String(env.AUTH_PASSWORD || '').trim();
+  const token = request.headers.get('Authorization')?.replace(/^Bearer\s+/i, '') || url.searchParams.get('auth') || '';
+
+  let authRequired = false;
+  let authorized = true;
+  let roomProtected = false;
+  // ⚠️★ 第三轮复审 P1：/server 是前端的「会话还活着吗」探测入口。
+  // 纪元读不出来时必须回 **503**（前端当网络故障、保留令牌稍后重探），
+  // 不能回 authorized:false —— 那会让前端以为会话失效、清掉本地令牌。
+  const verdictFor = async (room) => {
+    const requirement = resolveRoomAuth(env, room);
+    if (!requirement.required) return { required: false, verdict: SESSION_OK };
+    return { required: true, verdict: await validateRoomSessionToken(env, room, token) };
+  };
+  if (requestedRoom !== null) {
+    const { required, verdict } = await verdictFor(requestedRoom);
+    if (verdict === EPOCH_UNAVAILABLE) {
+      return errorResponse(503, 'epoch_unavailable', 'Session state unavailable, retry', '会话状态暂不可用，请稍后重试');
+    }
+    authRequired = required;
+    roomProtected = required;
+    authorized = !required || verdict === SESSION_OK;
+  } else if (globalPassword) {
+    const { verdict } = await verdictFor('default');
+    if (verdict === EPOCH_UNAVAILABLE) {
+      return errorResponse(503, 'epoch_unavailable', 'Session state unavailable, retry', '会话状态暂不可用，请稍后重试');
+    }
+    authRequired = true;
+    authorized = verdict === SESSION_OK;
+  }
+  
+  return new Response(JSON.stringify({
+    server: `${wsProtocol}//${url.host}/push`,
+    auth: authRequired,
+    authorized,
+    roomProtected,
+    version: "cloudflare-worker-v1.0.0",
+    roomList: isRoomListEnabled(env),
+    // ⚠️ 与 WS 握手 config 里的 `server.history`、以及 `GET /content` 的 limit 上限
+    // **是同一个数**（`historyLimit` 一处定义）—— 别在这里手写 `parseInt(env.HISTORY_LIMIT)`。
+    history: historyLimit(env),
+    // 定时自动化：Worker 侧**没有实现**这一族接口（没有 /tasks、没有 /automation，
+    // 也没有进程内调度器）。这里显式声明 enabled:false，而不是让这个字段干脆缺失 ——
+    // 缺失时前端分不清「这个后端不支持」和「这个字段还没送到」，
+    // 而 SPA 工具栏上那个入口正是按它决定渲不渲染（见 PageToolbar.vue 的 automationEnabled）。
+    // 显式声明之后，Cloudflare 部署里那个图标会稳定地不出现，而不是先闪出来再消失。
+    // ⚠️ 哪天 Worker 侧真的实现了，记得连同 dev-docs/api*.md §8 的「仅 Go 实现」一起改。
+    automation: { enabled: false },
+    // 文档转换：Worker 侧**没有实现**（整个 Worker 里没有 `/convert` ——
+    // 它是 JS 运行时，里面没有文档解析器）。同样**显式声明**，理由与上面 `automation` 一样。
+    //
+    // ⚠️★ 关键是那个 `reason`：**「这个后端不支持」和「这个构建没带 doc」是两件事，
+    // 修法也不同**（后者去重新构建，前者只能换后端）。以前前端只看 `enabled: false`，
+    // 于是**一律**说「构建时缺 doc」—— 在 Cloudflare 上那是错的，
+    // 用户会去翻构建配置白费功夫。现在服务端把原因说出来，前端不再猜。
+    convert: { enabled: false, extensions: [], reason: 'unsupported' },
+  }), {
+    headers: {
+      'Content-Type': 'application/json',
+      ...corsHeaders
+    }
+  });
+}
+
+export default {
+  async fetch(request, env, ctx) {
+    if (env.REQUIRE_PRIVATE === "1" && (String(env.AUTH_PASSWORD || "").trim().length < 20 || String(env.ROOM_SESSION_SECRET || "").length < 32)) {
+      return new Response("DropLeaf is not configured", { status: 503, headers: { "Cache-Control": "no-store" } });
+    }
+    try {
+      const response = await router.handle(request, env, ctx);
+      // ⚠️★ CORS 的**唯一**改写点（见 `src/cors.js` 的抬头）：handler 照旧铺 `*`，
+      // 这里按 `ALLOW_ORIGINS` 换成具体来源（或摘掉）。放在入口而不是每个 handler 里，
+      // 是为了「新加一条路由不会漏配」—— 漏配的症状是**只有跨源时**才出现的一句
+      // 「blocked by CORS policy」，而本机同源调试完全看不到。
+      return withCors(response, request, env);
+    } catch (error) {
+      console.error('Worker error:', error);
+      console.error('Worker stack:', error?.stack || '(no stack)');
+      const reason = String(error?.message || error || 'unknown');
+      return withCors(new Response(`Internal Server Error: ${reason}`, {
+        status: 500,
+        headers: corsHeaders
+      }), request, env);
+    }
+  },
+
+  // ── 定时任务：回收过期文件 ────────────────────────────────────────────────
+  //
+  // 周期**不在代码里**，在 `wrangler.toml` 的 `[triggers] crons`（默认 `*/5 * * * *`）——
+  // 这是 Cloudflare 表达周期的唯一方式（没有运行时调度器，也**不需要** DO alarm：
+  // 那个是**每房间**一个实例、只在该房间有活动时才活着，做不了全局回收）。
+  //
+  // ⚠️★ **配置与这个导出缺一不可**，而两者的失败方式正好相反：
+  //   · 只加 cron 不导出 `scheduled` → `wrangler deploy` 当场报错（好，吵得出来）；
+  //   · 只导出 `scheduled` 不加 cron  → **永远不触发，一声不响**。
+  // 所以 `test/file-cleanup.test.mjs` 里有一条静态判据同时盯着这两半。
+  //
+  // 具体做什么见 `src/file-cleanup.js`（与 Rust `server/src/file_cleanup.rs` 同语义）。
+  async scheduled(event, env, ctx) {
+    try {
+      const report = await sweepExpiredFiles(env);
+      if (report.expired > 0 || report.failed > 0) {
+        console.log('过期文件清理完成', report);
+      }
+    } catch (error) {
+      // ⚠️★ 出错**不能把任务打死**（与 Rust 那边同一条取舍）：它是个内务任务，
+      // 偶发的一次失败不该让「过期文件从此不再被回收」。
+      // 抛出去只会让这次 cron 调用标红，下一轮照样会跑 —— 但日志里要留痕。
+      console.error('过期文件清理出错（下一轮再试）:', error);
+    }
+  }
+};

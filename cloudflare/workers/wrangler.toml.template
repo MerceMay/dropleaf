@@ -1,0 +1,143 @@
+name = "dropleaf"
+main = "src/index.js"
+compatibility_date = "2025-08-01"
+compatibility_flags = ["nodejs_compat"]
+
+# ── *.workers.dev 那个域名要不要开（以及 Preview URLs）────────────────────────
+#
+# ⚠️★ **这个开关的主人是操作者**：CF 控制台 → Workers & Pages → 选中这个 Worker →
+# Settings → Domains & Routes 里那颗 Disable / Enable。用自定义域的人通常在**那里**关掉它。
+#
+# ⚠️★ 但 wrangler **没有**「别管这个键」这一说：**配置里不写 = 用默认值**，而默认是 `true`
+#（官方文档：`workers_dev` … *Defaults to `true`*），并且**每次部署都会照配置重设一遍** ——
+# 于是「在控制台关掉」会被下一次部署**原样打开**。2026-09-30 报上来的就是这一条。
+#
+# → 所以要表达「**别表态**」，只能部署前先读一眼现在是什么、再照原样写回来。
+#   `cloudflare/sync-workers-dev.mjs` 做这件事，两条部署路径都会在 `wrangler deploy`
+#   之前调它（CI 的工作流、以及本地 `deploy.sh`，后者只在有 API token 时才调）：
+#     · Worker 已经存在 → 写它现在那个值  ⇒ 部署**不再对这个键表态**；
+#     · 首次部署（还查不到这个脚本）→ 写 `true`，于是新部署者拿到一个能访问的地址。
+#
+# ⚠️ 下面这两行不是「默认值」，是**兜底**：读不到状态时用的那一份（脚本会拒绝在那种情况下
+# 继续，见它文件头的取舍）；本地手敲 `wrangler deploy` 时也只认这里。
+# 想让本地部署也别打开 workers.dev，把上面那行改成 false（那台就得靠自定义域访问）。
+workers_dev = true
+preview_urls = true
+
+# 托管前端静态资源（web/dist 的拷贝）
+#
+# 规则只有一条：命中静态资源就直接免费发出去，没命中就整包交给 Worker。
+# 所以这里必须是 "none" —— 不能用 "single-page-application"。
+#
+# 踩过的坑：SPA 回退只对「导航请求」生效，而浏览器点下载链接、直接打开分享链接
+# 恰好就是导航请求。于是 GET /file/<uuid>/<name> 压根到不了 Worker，
+# 被资源层回了一份 index.html —— 表现就是「下载下来是个 html」。
+# 前端 XHR 走的 /server、/text 反而是非导航请求，所以一直没人发现。
+# 现在改成：找不到资源就交给 Worker，由 Worker 自己兜底（见 src/index.js 末尾的 catch-all），
+# 这样「导航请求」和「XHR」走的是同一条路，不会再有两套行为。
+#
+# 也不要改用 run_worker_first 白名单：数组形式下「未匹配」的路径同样不会回落到 Worker，
+# 得把所有接口前缀一个个列全，漏一个就静默变 html。
+[assets]
+directory = "./assets"
+not_found_handling = "none"
+binding = "ASSETS"
+
+# 环境变量
+#
+# 正式部署走 GitHub Actions（.github/workflows/deploy-cloudflare.yml）：它把这个模板
+# 拷成 wrangler.toml，再用 repository secrets 覆盖下面这些值，然后 `wrangler deploy`。
+# 所以**线上跑的是 secret 里的值**；下面这些只是「secret 没设时的兜底」，
+# 而它们是公开仓库里写着的示例值 —— 忘了设 secret 就等于「以为有密码，其实密码公开」。
+#
+# ⚠️ 只有在**本地手敲 `wrangler deploy`** 时，下面这些值才会真的顶掉线上配置。
+#
+# ⚠️★ AUTH_PASSWORD **不写在模板里**（安全修复 2026-11-05）：明文密码会随仓库公开，
+# 旧模板的示例值等于把钥匙写在门上。两条部署通道（deploy.sh / 本地 deploy）都会在
+# AUTH_PASSWORD 仍是占位串时**阻断部署**；本地 dev 用 workers/.dev.vars（不入 Git）。
+#
+#   · 线上（推荐）：`wrangler secret put AUTH_PASSWORD` —— secret 不进配置、不入 Git、
+#     不会被 deploy 覆盖。密码请用高熵值（如 `openssl rand -base64 24` 生成）。
+#   · 本地 dev：workers/ 下建 `.dev.vars`（.gitignore 已排除）写 `AUTH_PASSWORD="..."`。
+#
+# 留空 = 实例开放访问（resolveRoomAuth → required:false，由部署者自己决定）。
+# 但「忘了设」不该静默等于开放 —— 所以这里是占位串，由 deploy.sh 强制校验兜底。
+[vars]
+AUTH_PASSWORD = "__SET_AUTH_PASSWORD_SECRET__"
+# DropLeaf：单空间，一般留空；旧多房间部署迁移时才需要保留
+ROOM_AUTH_JSON = ""
+ROOM_LIST = "false"
+HISTORY_LIMIT = "50"
+TEXT_LIMIT = "40960"
+FILE_LIMIT = "204857600"
+FILE_EXPIRE = "0"
+
+# 所有**未过期**文件加起来的**总量**上限（字节）。空 / `0` = 不限制（既有部署的行为不变）。
+#
+# ⚠️★ `FILE_LIMIT` 管的是**一个**文件，管不住账单：公开实例上谁都能反复传，
+#    3 MB × N 次可以把 R2 的 10 GB-month 免费额度填满 —— 而填满之后**不是报错，是开始计费**。
+#    公开演示站必须设这一条（见 `cloudflare/README.md` 的「公开演示站」）。
+# ⚠️ 只算未过期的文件（`expireTime = 0` 的永不过期，算在内）。所以它要和
+#    `FILE_EXPIRE` + `[triggers]` 的定时清理配套才自愈：顶满了等过期即可。
+FILE_TOTAL_LIMIT = ""
+
+# 过期文件清理的**开关**（秒。`<= 0` = 不跑，与自建服务端 `server.fileCleanup <= 0` 同约定）。
+#
+# ⚠️ 它**不管周期** —— 周期在那个 cron 表达式里（文件末尾的 `[triggers]`），
+#    Cloudflare 没有「运行时改周期」这一说。这里填 300 只是与 Rust 的缺省值对齐，
+#    代码只判正负（见 src/file-cleanup.js 的 isFileCleanupEnabled）。
+FILE_CLEANUP = "300"
+
+# ── 跨源来源白名单（**前后端分离部署**时才需要）─────────────────────────────
+#
+# 前端部署在别处（CDN / 静态托管）、只调这个 Worker 时，把前端的来源写在这里
+# （逗号分隔，只写到端口为止，例如 `https://clip.example.com,https://clip.example.org`）。
+#
+# ⚠️ 留空 = `Access-Control-Allow-Origin: *`（**历史行为**，谁都能跨源读）。
+#    托管服务的凭据是房间名 + 密码，所以 `*` 一直是可接受的缺省 ——
+#    而一旦填了，这里就变成**逐条白名单**：不在名单里的来源连一个 CORS 头都拿不到。
+# ⚠️ 拼错一条只会被忽略（其余照常生效）；**一整份都拼错**等于没配（仍回 `*`）——
+#    这条是为了「手滑不该把所有人的访问关掉」。所以填完记得看一眼线上响应头。
+ALLOW_ORIGINS = ""
+
+# D1 数据库绑定 (将被自动更新)
+[[d1_databases]]
+binding = "DB"
+database_name = "dropleaf-db"
+database_id = "your-d1-database-id"
+
+# R2 存储绑定
+[[r2_buckets]]
+binding = "R2_BUCKET"
+bucket_name = "dropleaf-files"
+
+# Durable Objects
+[[durable_objects.bindings]]
+name = "WEBSOCKET_ROOM"
+class_name = "WebSocketRoom"
+script_name = "dropleaf"
+
+# Durable Objects 迁移
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WebSocketRoom"]
+
+# ── 定时清理过期文件 ─────────────────────────────────────────────────────────
+#
+# 自建服务端（Rust `server/src/file_cleanup.rs`、Go `cleanExpiredFilesLoop`）是
+# **每 5 分钟**扫一遍：过期的文件 → 删字节 + 删文件登记 + 删时间线条目 + 广播 `revoke`。
+#
+# Worker 侧以前**只做请求路径上的惰性清理**：有人来 GET 一个已过期的 uuid 才顺手删。
+# 于是「再也没人访问的过期文件」永远留在 R2 里（R2 没有对象级 TTL，D1 那行也只有
+# 容量裁剪才会动）。这一段就是把后台那一半补上，语义与自建服务端一致。
+#
+# ⚠️★ **配了它还不够**：入口还得导出 `scheduled`（`src/index.js` 末尾）。
+#     少导出 → `wrangler deploy` 直接报错；少这段配置 → **永远不触发、一声不响**。
+#     两半都有静态判据盯着（`test/file-cleanup.test.mjs`）。
+#
+# ⚠️ 周期只能写在这里：换周期 = 改这一行再部署。`*/5 * * * *` 与 Rust 的
+#     `server.fileCleanup` 默认值（300 秒）对齐。免费版每个账号最多 5 个 cron 触发器。
+#
+# ⚠️ Cloudflare **不支持** cron 表达式里的「秒」字段 —— 最小粒度是分钟。
+[triggers]
+crons = ["*/5 * * * *"]

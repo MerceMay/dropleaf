@@ -1,0 +1,5 @@
+node_modules/
+.wrangler/
+.dev.vars*
+assets/
+test/.build/

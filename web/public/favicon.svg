@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <!-- Paste logo: two stacked sheets, the top one with a folded corner. -->
+  <!-- Back sheet (accent) peeking up-right behind the front sheet. -->
+  <rect x="20" y="4" width="40" height="40" rx="7" fill="#f2572b"/>
+  <!-- Front sheet (warm white) with its top-right corner cut for the fold. -->
+  <path d="M10 20 H32 L44 32 V53 A7 7 0 0 1 37 60 H10 A7 7 0 0 1 4 53 V27 A7 7 0 0 1 10 20 Z"
+        fill="#faf9f7" stroke="#f2572b" stroke-width="3" stroke-linejoin="round"/>
+  <!-- Folded corner flap (darker accent) flipped down over the front sheet. -->
+  <path d="M32 20 V32 H44 Z" fill="#c24622"/>
+</svg>

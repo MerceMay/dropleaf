@@ -1,0 +1,49 @@
+name = "dropleaf"
+main = "src/index.js"
+compatibility_date = "2025-08-01"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+preview_urls = false
+keep_vars = true
+
+[observability]
+enabled = true
+head_sampling_rate = 0.1
+
+[observability.traces]
+enabled = true
+head_sampling_rate = 0.01
+
+[assets]
+directory = "./assets"
+not_found_handling = "none"
+binding = "ASSETS"
+
+[vars]
+REQUIRE_PRIVATE = "1"
+HISTORY_LIMIT = "50"
+TEXT_LIMIT = "40960"
+FILE_LIMIT = "204857600"
+FILE_TOTAL_LIMIT = "8589934592"
+FILE_EXPIRE = "0"
+FILE_CLEANUP = "300"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "dropleaf-db"
+database_id = "7cf1803a-c204-4b08-bfee-d371088816b5"
+
+[[r2_buckets]]
+binding = "R2_BUCKET"
+bucket_name = "dropleaf-files"
+
+[[durable_objects.bindings]]
+name = "WEBSOCKET_ROOM"
+class_name = "WebSocketRoom"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["WebSocketRoom"]
+
+[triggers]
+crons = ["*/5 * * * *"]

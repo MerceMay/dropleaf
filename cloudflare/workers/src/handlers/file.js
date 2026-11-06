@@ -1,0 +1,935 @@
+import { corsHeaders } from '../cors';
+import { buildSenderDevice, saveToD1, broadcastMessage, generateUUID } from '../utils';
+import { ensureRoomAccess, normalizeRoomName } from '../auth';
+import { errorResponse } from '../errors';
+import { checkUploadBudget, checkInflightBudget } from '../upload-quota';
+import { buildContentDisposition, safeFileResponse } from '../file-response';
+
+function decodeUploadFilename(value = '') {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
+}
+
+
+const MULTIPART_MIN_PART_SIZE = 5 * 1024 * 1024;
+const DEFAULT_MULTIPART_PART_SIZE = 8 * 1024 * 1024;
+
+function getFileLimit(env) {
+  return env.FILE_LIMIT ? parseInt(env.FILE_LIMIT, 10) : 104857600;
+}
+
+// 按房间策略计算文件的绝对过期时间戳：
+//   fileExpire === 0        -> 返回 0（永不过期，读取端对 <=0 放行）
+//   fileExpire > 0          -> 覆盖全局 FILE_EXPIRE
+//   undefined/非法          -> 使用全局 FILE_EXPIRE
+function resolveExpireTime(currentTime, env, fileExpire) {
+  // DropLeaf：FILE_EXPIRE=0 = 永不过期（与房间 fileExpire===0 同语义）。
+  // 上游默认 3600；这里 <=0 一律视为「不过期」，读取端对 <=0 放行不变。
+  if (fileExpire === 0) {
+    return 0;
+  }
+  const globalSeconds = env.FILE_EXPIRE ? parseInt(env.FILE_EXPIRE, 10) : 3600;
+  if (fileExpire > 0) {
+    return currentTime + fileExpire;
+  }
+  return globalSeconds > 0 ? currentTime + globalSeconds : 0;
+}
+
+function getMultipartPartSize(env) {
+  const fileLimit = getFileLimit(env);
+  if (!Number.isFinite(fileLimit) || fileLimit <= MULTIPART_MIN_PART_SIZE) {
+    return fileLimit + 1;
+  }
+  return Math.min(fileLimit, DEFAULT_MULTIPART_PART_SIZE);
+}
+
+function createFileKey(uuid) {
+  return `files/${uuid}`;
+}
+
+function createUploadMetaKey(uuid) {
+  return `uploads/${uuid}/meta`;
+}
+
+function contentTypeFromName(filename = '') {
+  if (!filename) return 'application/octet-stream';
+  const ext = String(filename).split('.').pop()?.toLowerCase();
+  const map = {
+    jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif',
+    webp: 'image/webp', svg: 'image/svg+xml', bmp: 'image/bmp', ico: 'image/x-icon',
+    mp4: 'video/mp4', webm: 'video/webm', mov: 'video/quicktime', mkv: 'video/x-matroska', m4v: 'video/mp4',
+    mp3: 'audio/mpeg', wav: 'audio/wav', ogg: 'audio/ogg', m4a: 'audio/mp4', aac: 'audio/aac', flac: 'audio/flac',
+    pdf: 'application/pdf',
+    txt: 'text/plain', md: 'text/markdown', json: 'application/json', html: 'text/html', csv: 'text/csv',
+    zip: 'application/zip', tar: 'application/x-tar', gz: 'application/gzip', '7z': 'application/x-7z-compressed',
+  };
+  return map[ext] || 'application/octet-stream';
+}
+
+function extractUuidFromKey(key = '') {
+  return String(key || '').startsWith('files/') ? String(key).slice('files/'.length) : String(key || '');
+}
+
+function buildMultipartOptions({ room, fileName, fileType, expireTime }) {
+  return {
+    httpMetadata: {
+      contentType: fileType || 'application/octet-stream',
+      contentDisposition: buildContentDisposition(fileName, 'inline')
+    },
+    customMetadata: {
+      originalName: fileName,
+      uploadTime: Date.now().toString(),
+      expireTime: expireTime.toString(),
+      room,
+    }
+  };
+}
+
+async function finalizeUploadedFile({ request, env, url, room, uuid, fileName, fileSize, expireTime }) {
+  const fileUrl = `${url.origin}/file/${uuid}/${encodeURIComponent(fileName)}`;
+  const messageData = {
+    type: 'file',
+    name: fileName,
+    size: fileSize,
+    room,
+    timestamp: Math.floor(Date.now() / 1000),
+    senderIP: request.headers.get('CF-Connecting-IP') || 'unknown',
+    senderClientID: String(url.searchParams.get('client') || '').trim(), // 前端每客户端持久ID
+    userAgent: request.headers.get('User-Agent') || 'unknown',
+    deviceName: String(url.searchParams.get('name') || ''), // 客户端声明的设备名，空表示未声明
+    uuid,
+    expireTime,
+    url: fileUrl
+  };
+  const senderDevice = buildSenderDevice(messageData.userAgent, messageData.deviceName);
+
+  const saveResult = await saveToD1(env.DB, messageData, env);
+  const messageId = saveResult.messageId;
+  const filesToCleanup = saveResult.filesToCleanup;
+
+  console.log('[upload] saved message', {
+    room,
+    uuid,
+    messageId,
+    cleanupCount: filesToCleanup.length,
+  });
+
+  if (filesToCleanup.length > 0 && env.R2_BUCKET) {
+    console.log(`清理 ${filesToCleanup.length} 个旧文件`);
+    for (const fileUuid of filesToCleanup) {
+      try {
+        await env.R2_BUCKET.delete(createFileKey(fileUuid));
+        console.log(`已删除旧文件: ${fileUuid}`);
+      } catch (deleteError) {
+        console.error(`删除文件失败: ${fileUuid}`, deleteError);
+      }
+    }
+  }
+
+  await broadcastMessage(env, room, {
+    event: 'receive',
+    data: {
+      ...messageData,
+      id: messageId,
+      expire: expireTime,
+      cache: uuid,
+      senderDevice,
+    }
+  });
+
+  const contentURL = `${url.origin}/content/${messageId}${room !== 'default' ? `?room=${room}` : ''}`;
+
+  console.log('[upload] success', {
+    room,
+    uuid,
+    messageId,
+    contentURL,
+  });
+
+  return new Response(JSON.stringify({
+    id: messageId.toString(),
+    type: FileHandler.determineFileType(fileName),
+    url: contentURL
+  }), {
+    headers: { 'Content-Type': 'application/json', ...corsHeaders }
+  });
+}
+
+/**
+ * Multipart 里的文件 part：
+ *   - `file`     —— 单文件（Apple 快捷指令 / 网页 / 桌面端，旧形状）
+ *   - `file[]`   —— 多文件（HTTP Shortcuts 的 `file_picker_multi`）
+ *
+ * ⚠️ 多文件必须**一条 part 一条消息**，与网页端「每个文件一个请求」语义一致；
+ *    返回值也只在多文件（或显式 `file[]`）时才变成 `{count, ids, files}`，
+ *    单 `file` 仍然是 `{id, type, url}` —— 老客户端不用改。
+ */
+function collectFormFiles(formData) {
+  const files = [];
+  let multi = false;
+  for (const [field, value] of formData.entries()) {
+    if (field !== 'file' && field !== 'file[]') continue;
+    if (field === 'file[]') multi = true;
+    if (!value || typeof value !== 'object' || typeof value.stream !== 'function') continue;
+    const name = value.name || 'file';
+    files.push({
+      name,
+      size: Number(value.size || 0),
+      type: value.type || contentTypeFromName(name),
+      stream: () => value.stream(),
+    });
+  }
+  if (files.length > 1) multi = true;
+  return { files, multi };
+}
+
+async function uploadFormFiles({ request, env, url, room, authResult, formData }) {
+  const { files, multi } = collectFormFiles(formData);
+  if (!files.length) {
+    return errorResponse(400, 'no_file', 'No file provided', '未提供文件');
+  }
+
+  const fileLimit = getFileLimit(env);
+  const tooLarge = files.find((item) => item.size > fileLimit);
+  if (tooLarge) {
+    return errorResponse(
+      413,
+      'file_too_large',
+      'File too large',
+      `文件大小超出限制 (最大 ${Math.floor(fileLimit / 1024 / 1024)}MB，${tooLarge.name} 为 ${tooLarge.size} 字节)`
+    );
+  }
+
+  // ⚠️ 总量按**整个请求**一次判：分开判会在第一份落盘、第二份被拒时留下半批文件。
+  const totalSize = files.reduce((sum, item) => sum + item.size, 0);
+  const overBudget = await checkUploadBudget(env, totalSize);
+  if (overBudget) {
+    return overBudget;
+  }
+
+  const expireTime = resolveExpireTime(
+    Math.floor(Date.now() / 1000),
+    env,
+    authResult.requirement?.fileExpire
+  );
+  const prepared = files.map((item) => ({ ...item, uuid: generateUUID() }));
+  const storedKeys = [];
+
+  try {
+    for (const item of prepared) {
+      await env.R2_BUCKET.put(
+        createFileKey(item.uuid),
+        item.stream(),
+        buildMultipartOptions({
+          room,
+          fileName: item.name,
+          fileType: item.type,
+          expireTime,
+        })
+      );
+      storedKeys.push(createFileKey(item.uuid));
+    }
+  } catch (error) {
+    // 还一条消息都没建；把已经写进 R2 的字节删掉，别留孤儿。
+    for (const key of storedKeys) {
+      try { await env.R2_BUCKET.delete(key); } catch {}
+    }
+    throw error;
+  }
+
+  const results = [];
+  for (const item of prepared) {
+    const response = await finalizeUploadedFile({
+      request,
+      env,
+      url,
+      room,
+      uuid: item.uuid,
+      fileName: item.name,
+      fileSize: item.size,
+      expireTime,
+    });
+    const data = await response.json();
+    results.push({ ...data, name: item.name, size: item.size });
+  }
+
+  if (!multi) {
+    const first = results[0];
+    return new Response(JSON.stringify({
+      id: first.id,
+      type: first.type,
+      url: first.url,
+    }), {
+      headers: { 'Content-Type': 'application/json', ...corsHeaders }
+    });
+  }
+
+  return new Response(JSON.stringify({
+    count: results.length,
+    ids: results.map((item) => String(item.id)),
+    files: results,
+  }), {
+    headers: { 'Content-Type': 'application/json', ...corsHeaders }
+  });
+}
+
+export class FileHandler {
+  static async upload(request, env) {
+    try {
+      const url = new URL(request.url);
+      const room = normalizeRoomName(url.searchParams.get('room'));
+      const authResult = await ensureRoomAccess(request, env, room);
+      if (!authResult.ok) {
+        return authResult.response;
+      }
+
+      if (!env.R2_BUCKET) {
+        return errorResponse(503, 'storage_unavailable', 'Storage not available', '文件存储服务不可用');
+      }
+
+      const rawFileName = request.headers.get('X-File-Name');
+      const isStreamUpload = Boolean(rawFileName);
+      let fileName = '';
+      let fileSize = 0;
+      let fileType = request.headers.get('Content-Type') || 'application/octet-stream';
+      let fileBody = null;
+
+      console.log('[upload] start', {
+        room,
+        hasAuthHeader: Boolean(request.headers.get('Authorization')),
+        contentType: fileType,
+        hasRawFilenameHeader: isStreamUpload,
+      });
+
+      if (!isStreamUpload) {
+        const formData = await request.formData();
+        return await uploadFormFiles({
+          request,
+          env,
+          url,
+          room,
+          authResult,
+          formData,
+        });
+      }
+
+      fileName = decodeUploadFilename(rawFileName) || 'file';
+      fileSize = Number(request.headers.get('X-File-Size') || 0);
+      fileBody = request.body;
+
+      console.log('[upload] parsed', {
+        room,
+        isStreamUpload,
+        fileName,
+        fileSize,
+        fileType,
+        hasBody: Boolean(fileBody),
+      });
+
+      if (!fileBody || !fileName) {
+        return errorResponse(400, 'no_file', 'No file provided', '未提供文件');
+      }
+
+      // 检查文件大小限制
+      const fileLimit = getFileLimit(env);
+      if (fileSize > fileLimit) {
+        return errorResponse(413, 'file_too_large', 'File too large', `文件大小超出限制 (最大 ${Math.floor(fileLimit / 1024 / 1024)}MB)`);
+      }
+
+      // ⚠️★ 总量闸放在 **R2 写之前**：一旦字节落了盘，即使事后拒绝也已经在占额度了
+      //（而那条没变成消息的字节，清理任务也找不到它）。
+      const overBudget = await checkUploadBudget(env, fileSize);
+      if (overBudget) {
+        return overBudget;
+      }
+
+      const uuid = generateUUID();
+      const currentTime = Math.floor(Date.now() / 1000);
+      const expireTime = resolveExpireTime(currentTime, env, authResult.requirement?.fileExpire);
+
+      // 上传文件到 R2
+      await env.R2_BUCKET.put(createFileKey(uuid), fileBody, buildMultipartOptions({ room, fileName, fileType, expireTime }));
+
+      console.log('[upload] stored in r2', {
+        room,
+        uuid,
+        fileName,
+        fileSize,
+      });
+
+      return await finalizeUploadedFile({
+        request,
+        env,
+        url,
+        room,
+        uuid,
+        fileName,
+        fileSize,
+        expireTime,
+      });
+
+    } catch (error) {
+      console.error('File upload error:', error);
+      console.error('File upload stack:', error?.stack || '(no stack)');
+      const reason = String(error?.message || error || 'unknown');
+      console.error('File upload reason:', reason);
+      return errorResponse(500, 'internal_error', 'Internal Server Error', `上传文件时发生错误: ${reason}`);
+    }
+  }
+
+  static async createChunk(request, env) {
+    try {
+      const url = new URL(request.url);
+      const room = normalizeRoomName(url.searchParams.get('room'));
+      const authResult = await ensureRoomAccess(request, env, room);
+      if (!authResult.ok) {
+        return authResult.response;
+      }
+
+      if (!env.R2_BUCKET) {
+        return errorResponse(503, 'storage_unavailable', 'Storage not available', '文件存储服务不可用');
+      }
+
+      const fileName = String(await request.text() || '').trim();
+      if (!fileName) {
+        return errorResponse(400, 'invalid_file_name', 'Invalid file name', '未提供文件名');
+      }
+
+      // 开一个分片会话 = 占一个「还没收尾」的名额；满了先拦住（详见 upload-quota.js）。
+      const tooMany = await checkInflightBudget(env);
+      if (tooMany) {
+        return tooMany;
+      }
+      // ⚠️ 这里还不知道最终多大，所以只拦「连 1 字节都放不下」的那种满。
+      //    真正的判断在 `uploadChunkPart`（按累计大小）与 `finishChunk`（收尾前）。
+      const overBudget = await checkUploadBudget(env, 1);
+      if (overBudget) {
+        return overBudget;
+      }
+
+      const currentTime = Math.floor(Date.now() / 1000);
+      const uuid = generateUUID();
+      const expireTime = resolveExpireTime(currentTime, env, authResult.requirement?.fileExpire);
+      const fileType = contentTypeFromName(fileName);
+
+      // 使用 R2 原生 multipart upload：各分块作为 multipart part 上传，
+      // 由 R2 在服务端合并为最终对象。避免用未知长度的自定义 ReadableStream put（R2 会拒绝）。
+      const upload = await env.R2_BUCKET.createMultipartUpload(
+        createFileKey(uuid),
+        buildMultipartOptions({ room, fileName, fileType, expireTime })
+      );
+
+      await env.R2_BUCKET.put(createUploadMetaKey(uuid), JSON.stringify({
+        name: fileName,
+        room,
+        expireTime,
+        uploadId: upload.uploadId,
+        parts: [],
+        totalSize: 0,
+        created: currentTime,
+      }));
+
+      console.log('[chunk] created', { room, uuid, fileName, expireTime, uploadId: upload.uploadId });
+
+      return new Response(JSON.stringify({
+        result: { uuid }
+      }), {
+        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+      });
+    } catch (error) {
+      console.error('Create chunk upload error:', error);
+      console.error('Create chunk upload stack:', error?.stack || '(no stack)');
+      return errorResponse(500, 'internal_error', 'Internal Server Error', '初始化分块上传时发生错误');
+    }
+  }
+
+  static async uploadChunkPart(request, env) {
+    try {
+      const url = new URL(request.url);
+      const uuid = String(request.params.uuid || '').trim();
+      if (!uuid || !env.R2_BUCKET) {
+        return errorResponse(400, 'invalid_uuid', 'Invalid request', '无效的 UUID');
+      }
+
+      const metaObject = await env.R2_BUCKET.get(createUploadMetaKey(uuid));
+      if (!metaObject) {
+        return errorResponse(400, 'invalid_uuid', 'Invalid UUID', '无效的 UUID');
+      }
+      const meta = JSON.parse(await metaObject.text());
+      const room = normalizeRoomName(meta.room);
+
+      const authResult = await ensureRoomAccess(request, env, room);
+      if (!authResult.ok) {
+        return authResult.response;
+      }
+
+      if (!request.body) {
+        return errorResponse(400, 'empty_chunk', 'Empty chunk', '分块数据为空');
+      }
+
+      const fileLimit = getFileLimit(env);
+      const chunkSize = Number(request.headers.get('Content-Length') || 0);
+      if (fileLimit > 0 && (Number(meta.totalSize || 0) + chunkSize) > fileLimit) {
+        return errorResponse(413, 'file_too_large', 'File too large', `文件大小超出限制 (最大 ${Math.floor(fileLimit / 1024 / 1024)}MB)`);
+      }
+
+      // ⚠️ 分片的字节是**逐片落盘**的（`startChunkUpload` 那条注释说的），所以要在
+      //    每一片之前判一次总量：`已提交 + 这个会话已写的 + 这一片`。
+      const overBudget = await checkUploadBudget(env, Number(meta.totalSize || 0) + chunkSize);
+      if (overBudget) {
+        return overBudget;
+      }
+
+      const upload = env.R2_BUCKET.resumeMultipartUpload(createFileKey(uuid), meta.uploadId);
+      const partNumber = (meta.parts.length || 0) + 1;
+      const part = await upload.uploadPart(partNumber, request.body);
+
+      meta.parts.push({ partNumber, etag: part.etag });
+      meta.totalSize = Number(meta.totalSize || 0) + chunkSize;
+      await env.R2_BUCKET.put(createUploadMetaKey(uuid), JSON.stringify(meta));
+
+      console.log('[chunk] uploaded part', { uuid, partNumber, etag: part.etag, size: chunkSize });
+
+      return new Response(JSON.stringify({}), {
+        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+      });
+    } catch (error) {
+      console.error('Upload chunk part error:', error);
+      console.error('Upload chunk part stack:', error?.stack || '(no stack)');
+      return errorResponse(500, 'internal_error', 'Internal Server Error', '上传分块数据时发生错误');
+    }
+  }
+
+  static async finishChunk(request, env) {
+    try {
+      const url = new URL(request.url);
+      const uuid = String(request.params.uuid || '').trim();
+      const room = normalizeRoomName(url.searchParams.get('room'));
+
+      const authResult = await ensureRoomAccess(request, env, room);
+      if (!authResult.ok) {
+        return authResult.response;
+      }
+
+      if (!env.R2_BUCKET) {
+        return errorResponse(503, 'storage_unavailable', 'Storage not available', '文件存储服务不可用');
+      }
+
+      const metaObject = await env.R2_BUCKET.get(createUploadMetaKey(uuid));
+      if (!metaObject) {
+        return errorResponse(400, 'invalid_uuid', 'Invalid UUID', '无效的 UUID');
+      }
+      const meta = JSON.parse(await metaObject.text());
+      const fileName = meta.name || 'file';
+      const expireTime = Number(meta.expireTime || 0);
+      const fileRoom = normalizeRoomName(meta.room || room);
+      const parts = meta.parts || [];
+
+      if (!meta.uploadId || !parts.length) {
+        return errorResponse(400, 'no_chunks', 'No chunks', '未找到上传的分块');
+      }
+
+      // ⚠️ 收尾前再判一次：会话开着的时候（可能几十分钟）别人可能已经把空间用掉了。
+      const overBudget = await checkUploadBudget(env, Number(meta.totalSize || 0));
+      if (overBudget) {
+        return overBudget;
+      }
+
+      const upload = env.R2_BUCKET.resumeMultipartUpload(createFileKey(uuid), meta.uploadId);
+      const completedObject = await upload.complete(
+        parts
+          .slice()
+          .sort((a, b) => a.partNumber - b.partNumber)
+          .map((p) => ({ partNumber: p.partNumber, etag: p.etag }))
+      );
+      const fileSize = Number(completedObject?.size || meta.totalSize || 0);
+
+      console.log('[chunk] finalized', { room: fileRoom, uuid, fileName, fileSize, expireTime });
+
+      await env.R2_BUCKET.delete(createUploadMetaKey(uuid));
+
+      return await finalizeUploadedFile({
+        request,
+        env,
+        url,
+        room: fileRoom,
+        uuid,
+        fileName,
+        fileSize,
+        expireTime,
+      });
+    } catch (error) {
+      console.error('Finish chunk upload error:', error);
+      console.error('Finish chunk upload stack:', error?.stack || '(no stack)');
+      return errorResponse(500, 'internal_error', 'Internal Server Error', '完成分块上传时发生错误');
+    }
+  }
+
+  static async createMultipart(request, env) {
+    try {
+      const url = new URL(request.url);
+      const room = normalizeRoomName(url.searchParams.get('room'));
+      const authResult = await ensureRoomAccess(request, env, room);
+      if (!authResult.ok) {
+        return authResult.response;
+      }
+
+      if (!env.R2_BUCKET) {
+        return errorResponse(503, 'storage_unavailable', 'Storage not available', '文件存储服务不可用');
+      }
+
+      const body = await request.json();
+      const fileName = String(body?.name || '').trim();
+      const fileSize = Number(body?.size || 0);
+      const fileType = String(body?.type || 'application/octet-stream');
+
+      if (!fileName || !fileSize) {
+        return errorResponse(400, 'invalid_file_metadata', 'Invalid file metadata', '文件元数据无效');
+      }
+
+      const fileLimit = getFileLimit(env);
+      if (fileSize > fileLimit) {
+        return errorResponse(413, 'file_too_large', 'File too large', `文件大小超出限制 (最大 ${Math.floor(fileLimit / 1024 / 1024)}MB)`);
+      }
+
+      // ⚠️ 建 multipart 会话时就知道总大小，所以在**一片都还没写**的时候就能判总量。
+      const tooMany = await checkInflightBudget(env);
+      if (tooMany) {
+        return tooMany;
+      }
+      const overBudget = await checkUploadBudget(env, fileSize);
+      if (overBudget) {
+        return overBudget;
+      }
+
+      const uuid = generateUUID();
+      const key = createFileKey(uuid);
+      const expireTime = resolveExpireTime(Math.floor(Date.now() / 1000), env, authResult.requirement?.fileExpire);
+      const upload = await env.R2_BUCKET.createMultipartUpload(key, buildMultipartOptions({ room, fileName, fileType, expireTime }));
+      const partSize = getMultipartPartSize(env);
+
+      console.log('[multipart] created', {
+        room,
+        uuid,
+        key,
+        uploadId: upload.uploadId,
+        fileName,
+        fileSize,
+        partSize,
+      });
+
+      return new Response(JSON.stringify({
+        result: {
+          uuid,
+          key,
+          uploadId: upload.uploadId,
+          partSize,
+          minPartSize: MULTIPART_MIN_PART_SIZE,
+        }
+      }), {
+        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+      });
+    } catch (error) {
+      console.error('Create multipart upload error:', error);
+      console.error('Create multipart upload stack:', error?.stack || '(no stack)');
+      return errorResponse(500, 'internal_error', 'Internal Server Error', '初始化分片上传时发生错误');
+    }
+  }
+
+  static async uploadMultipartPart(request, env) {
+    try {
+      const url = new URL(request.url);
+      const room = normalizeRoomName(url.searchParams.get('room'));
+      const authResult = await ensureRoomAccess(request, env, room);
+      if (!authResult.ok) {
+        return authResult.response;
+      }
+
+      const uploadId = String(url.searchParams.get('uploadId') || '').trim();
+      const key = String(url.searchParams.get('key') || '').trim();
+      const partNumber = Number(request.params.partNumber);
+
+      if (!uploadId || !key || !partNumber || !request.body) {
+        return errorResponse(400, 'invalid_multipart_params', 'Invalid multipart request', '分片上传参数无效');
+      }
+
+      const upload = env.R2_BUCKET.resumeMultipartUpload(key, uploadId);
+      const part = await upload.uploadPart(partNumber, request.body);
+
+      console.log('[multipart] uploaded part', {
+        room,
+        key,
+        uploadId,
+        partNumber,
+      });
+
+      return new Response(JSON.stringify({ result: part }), {
+        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+      });
+    } catch (error) {
+      console.error('Multipart upload part error:', error);
+      console.error('Multipart upload part stack:', error?.stack || '(no stack)');
+      return errorResponse(500, 'internal_error', 'Internal Server Error', '上传文件分片时发生错误');
+    }
+  }
+
+  static async completeMultipart(request, env) {
+    try {
+      const url = new URL(request.url);
+      const room = normalizeRoomName(url.searchParams.get('room'));
+      const authResult = await ensureRoomAccess(request, env, room);
+      if (!authResult.ok) {
+        return authResult.response;
+      }
+
+      const body = await request.json();
+      const uploadId = String(body?.uploadId || '').trim();
+      const key = String(body?.key || '').trim();
+      const parts = Array.isArray(body?.parts) ? [...body.parts] : [];
+
+      if (!uploadId || !key || !parts.length) {
+        return errorResponse(400, 'invalid_multipart_complete_params', 'Invalid multipart request', '分片完成参数无效');
+      }
+
+      // ⚠️ 会话是**建的时候**判过总量的，但它可能开了很久（空间在这期间被别人用掉）。
+      //    收尾前按客户端声明的大小再判一次；声明缺失就放行（此时字节其实已经写完了，
+      //    多拦一次只会留下更麻烦的孤儿分片 — 见 upload-quota.js 抬头那段）。
+      const declaredSize = Number(body?.size || 0);
+      if (declaredSize > 0) {
+        const overBudget = await checkUploadBudget(env, declaredSize);
+        if (overBudget) {
+          return overBudget;
+        }
+      }
+
+      const upload = env.R2_BUCKET.resumeMultipartUpload(key, uploadId);
+      const completedObject = await upload.complete(parts.sort((left, right) => left.partNumber - right.partNumber));
+      const uuid = extractUuidFromKey(key);
+
+      // complete() 的响应可能不携带 customMetadata，用 head() 读取权威元数据，
+      // 避免 expireTime 丢失导致前端立即显示“已过期”
+      let storedExpireTime = null;
+      let storedName = '';
+      try {
+        const headObject = await env.R2_BUCKET.head(key);
+        const rawExpire = headObject?.customMetadata?.expireTime;
+        if (rawExpire !== undefined && rawExpire !== null && String(rawExpire).trim() !== '') {
+          const numeric = Number(rawExpire);
+          if (Number.isFinite(numeric)) {
+            storedExpireTime = Math.floor(numeric);
+          }
+        }
+        storedName = String(headObject?.customMetadata?.originalName || '');
+      } catch (headError) {
+        console.warn('[multipart] head metadata failed:', headError?.stack || headError);
+      }
+      // 创建分片时写入的元数据（含 0=永久）优先；仅当元数据缺失时才按当前房间策略/全局值补算
+      const expireTime = storedExpireTime !== null
+        ? storedExpireTime
+        : resolveExpireTime(Math.floor(Date.now() / 1000), env, authResult.requirement?.fileExpire);
+      const fileName = storedName || body?.name || uuid || 'file';
+      const fileSize = Number(completedObject.size || body?.size || 0);
+
+      console.log('[multipart] completed', {
+        room,
+        uuid,
+        key,
+        uploadId,
+        fileName,
+        fileSize,
+      });
+
+      return await finalizeUploadedFile({
+        request,
+        env,
+        url,
+        room,
+        uuid,
+        fileName,
+        fileSize,
+        expireTime,
+      });
+    } catch (error) {
+      console.error('Complete multipart upload error:', error);
+      console.error('Complete multipart upload stack:', error?.stack || '(no stack)');
+      return errorResponse(500, 'internal_error', 'Internal Server Error', '完成分片上传时发生错误');
+    }
+  }
+
+  static async abortMultipart(request, env) {
+    try {
+      const url = new URL(request.url);
+      const room = normalizeRoomName(url.searchParams.get('room'));
+      const authResult = await ensureRoomAccess(request, env, room);
+      if (!authResult.ok) {
+        return authResult.response;
+      }
+
+      const uploadId = String(url.searchParams.get('uploadId') || '').trim();
+      const key = String(url.searchParams.get('key') || '').trim();
+      if (!uploadId || !key) {
+        return errorResponse(400, 'missing_upload_params', 'Invalid multipart request', '缺少 uploadId 或 key');
+      }
+
+      const upload = env.R2_BUCKET.resumeMultipartUpload(key, uploadId);
+      await upload.abort();
+
+      console.log('[multipart] aborted', {
+        room,
+        key,
+        uploadId,
+      });
+
+      return new Response(JSON.stringify({
+        status: '已取消分片上传'
+      }), {
+        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+      });
+    } catch (error) {
+      console.error('Abort multipart upload error:', error);
+      console.error('Abort multipart upload stack:', error?.stack || '(no stack)');
+      return errorResponse(500, 'internal_error', 'Internal Server Error', '取消分片上传时发生错误');
+    }
+  }
+
+  static async download(request, env) {
+    try {
+      const { uuid, filename } = request.params;
+      console.log(`文件下载请求: UUID ${uuid}, filename: ${filename}`);
+
+      const object = env.R2_BUCKET ? await env.R2_BUCKET.get(`files/${uuid}`) : null;
+      const room = normalizeRoomName(object?.customMetadata?.room || 'default');
+      const authResult = await ensureRoomAccess(request, env, room);
+      if (!authResult.ok) {
+        return authResult.response;
+      }
+      
+      if (!env.R2_BUCKET) {
+        return new Response('Storage not available', { 
+          status: 503,
+          headers: corsHeaders 
+        });
+      }
+      
+      if (!object) {
+        console.log(`文件未找到: ${uuid}`);
+        return new Response('File not found', { 
+          status: 404,
+          headers: corsHeaders 
+        });
+      }
+
+      // 检查文件是否过期
+      const expireTime = parseInt(object.customMetadata?.expireTime || '0');
+      const currentTime = Math.floor(Date.now() / 1000);
+      if (expireTime > 0 && currentTime > expireTime) {
+        console.log(`文件已过期: ${uuid}, expireTime: ${expireTime}, currentTime: ${currentTime}`);
+        // 删除过期文件
+        await env.R2_BUCKET.delete(`files/${uuid}`);
+        return new Response('File expired', { 
+          status: 404,
+          headers: corsHeaders 
+        });
+      }
+
+      console.log(`文件下载成功: ${uuid}, size: ${object.size}, type: ${object.httpMetadata?.contentType}`);
+
+      // ── 响应头安全策略（2026-11-05 安全修复）──────────────────────────────
+      // 规则只在 `file-response.js` 里写一份：`/file` 与 `/content/:id` 的 raw 分支
+      // 共用同一套（上一轮只修了这里，另一个入口漏掉过）。
+      const url = new URL(request.url);
+      const originalName = object.customMetadata?.originalName || filename || 'file';
+
+      return safeFileResponse(object, {
+        originalName,
+        forceDownload: url.searchParams.get('download') === 'true',
+      });
+
+    } catch (error) {
+      console.error('File download error:', error);
+      console.error('Error stack:', error.stack);
+      return new Response('Internal Server Error', { 
+        status: 500,
+        headers: corsHeaders
+      });
+    }
+  }
+
+  static async delete(request, env) {
+    try {
+      let room = 'default';
+      if (env.R2_BUCKET) {
+        const object = await env.R2_BUCKET.head(`files/${request.params.uuid}`);
+        if (object?.customMetadata?.room) {
+          room = normalizeRoomName(object.customMetadata.room);
+        }
+      }
+
+      if (room === 'default' && env.DB) {
+        const fileRecord = await env.DB.prepare('SELECT room FROM messages WHERE uuid = ? ORDER BY id DESC LIMIT 1')
+          .bind(request.params.uuid)
+          .first();
+        if (fileRecord?.room) {
+          room = normalizeRoomName(fileRecord.room);
+        }
+      }
+
+      const authResult = await ensureRoomAccess(request, env, room);
+      if (!authResult.ok) {
+        return authResult.response;
+      }
+
+      const { uuid } = request.params;
+      console.log(`删除文件请求: UUID ${uuid}`);
+      
+      if (env.R2_BUCKET) {
+        // 从 R2 删除文件
+        await env.R2_BUCKET.delete(`files/${uuid}`);
+        console.log(`文件已从 R2 删除: ${uuid}`);
+      }
+      
+      if (env.DB) {
+        // 从 D1 删除相关记录
+        await env.DB.prepare('DELETE FROM messages WHERE uuid = ?').bind(uuid).run();
+        console.log(`文件记录已从 D1 删除: ${uuid}`);
+      }
+
+      return new Response(JSON.stringify({
+        status: '文件删除成功'
+      }), {
+        headers: { 'Content-Type': 'application/json', ...corsHeaders }
+      });
+
+    } catch (error) {
+      console.error('File delete error:', error);
+      console.error('Error stack:', error.stack);
+      return errorResponse(500, 'internal_error', 'Internal Server Error', '删除文件时发生错误');
+    }
+  }
+
+  static determineFileType(filename) {
+    if (!filename) return 'file';
+    
+    const ext = filename.split('.').pop()?.toLowerCase();
+    const imageExts = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg', 'bmp', 'ico'];
+    const videoExts = ['mp4', 'webm', 'ogg', 'mov', 'avi', 'mkv', 'm4v'];
+    const audioExts = ['mp3', 'wav', 'ogg', 'm4a', 'aac', 'flac'];
+    
+    if (imageExts.includes(ext)) return 'image';
+    if (videoExts.includes(ext)) return 'video';
+    if (audioExts.includes(ext)) return 'audio';
+    return 'file';
+  }
+
+  // 添加获取文件大小格式化的方法
+  static formatFileSize(bytes) {
+    if (bytes === 0) return '0 B';
+    const k = 1024;
+    const sizes = ['B', 'KB', 'MB', 'GB'];
+    const i = Math.floor(Math.log(bytes) / Math.log(k));
+    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+  }
+}

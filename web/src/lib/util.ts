@@ -1,0 +1,328 @@
+/**
+ * 框架无关的工具函数 —— 从 web-vue3/src/util.js 移植。
+ *
+ * ⚠️ 这一层（`src/lib/`）**不许 import React / MUI / 路由**：它同时要被
+ *   ① 网页版、② 桌面端（经 tools/sync-action-catalog.mjs 字节同步）、③ 未来的共享包复用。
+ * ⚠️ 与 `lib/markdown.js` 的分工：依赖 marked / DOMPurify 的 `renderMarkdownHtml` 在那边。
+ */
+import { APP_BASE_URL } from './base';
+import { hasCodeMarkup, hasMathMarkup, looksLikeTable, looksLikeTaskList } from './actions/pure.js';
+
+// 这些**纯函数**住在 `actions/pure.js`（零 import，两端共用）—— 这里只是再导出一次，
+// 让调用点（`import { looksLikeTable } from '@/lib/util'`）保持与 Vue 版一致的写法。
+export {
+    decodeHtmlEntities,
+    formatJson,
+    hasCodeMarkup,
+    hasMathMarkup,
+    looksLikeCode,
+    looksLikeMarkdown,
+    looksLikeTable,
+    looksLikeTaskList,
+    minifyJson,
+} from './actions/pure.js';
+
+export function prettyFileSize(size: number): string {
+    const units = ['TB', 'GB', 'MB', 'KB'];
+    let unit = 'Bytes';
+    while (size >= 1024 && units.length) {
+        size /= 1024;
+        unit = units.pop() as string;
+    }
+    return `${Math.floor(100 * size) / 100} ${unit}`;
+}
+
+export function percentage(value: number, decimal = 2): string {
+    return `${(value * 100).toFixed(decimal)}%`;
+}
+
+/**
+ * 文件的「同一条」判据：**名字 + 字节数 + 修改时间**。
+ *
+ * ⚠️ 只用名字不够 —— 用户完全可能同时选到两个 `IMG_0001.jpg`（不同目录）；
+ * 只用 `name+size` 也不够 —— 同一张图改过一版但大小恰好相同就会当成同一个。
+ * 三者一起，才既不会把两条不同的文件合成一条，也不会把同一个文件重复加。
+ */
+function fileIdentity(file: File): string {
+    return `${file.name}\u0000${file.size}\u0000${file.lastModified}`;
+}
+
+/**
+ * 把「这一次选中的文件」并进已有的列表 —— **追加，不是替换**（2026-10-26）。
+ *
+ * ⚠️★ 原来是 `setState({ files })` 直接替换。桌面上感觉不出来（用户一次性框选/拖一堆），
+ * 但手机上的典型操作是「点添加 → 选一个 → 再点添加」，于是**每加一个都把前面选的清空**，
+ * 最后只剩最后一个发出去 —— 用户看到的就是「选了三个文件，只成功其中一个」。
+ * 反馈来源：2026-10-26（手机端）。
+ *
+ * ⚠️ 去重是必须的（不是顺手）：追加之后「同一个文件又选了一次」会变成两个 chips、
+ * 上传两份字节，而用户没有任何提示。chips 的删除按钮才是移除的唯一入口。
+ *
+ * ⚠️ 抽在这里而不是各 composer 各写一份：发送区有两套实现（`UnifiedComposer` /
+ * `StickyComposer`），这条规矩必须只有一个答案。
+ */
+export function mergeSelectedFiles(current: File[], incoming: File[]): File[] {
+    const merged = [...current];
+    const seen = new Set(merged.map(fileIdentity));
+    for (const file of incoming) {
+        const key = fileIdentity(file);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        merged.push(file);
+    }
+    return merged;
+}
+
+export function formatTimestamp(timestamp?: number): string {
+    if (!timestamp) return '';
+    const date = new Date(timestamp * 1000);
+    // 返回更详细的日期和时间格式，例如: YYYY-MM-DD HH:mm:ss
+    return date.toLocaleString(undefined, {
+        year: 'numeric', month: '2-digit', day: '2-digit',
+        hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+    });
+}
+
+/** 两位补零。时间相关的几个格式化都从这里过，别再各写一份。 */
+function pad2(value: number): string {
+    return String(value).padStart(2, '0');
+}
+
+/**
+ * `timestamp`（秒）→ **本地**的 `YYYY-MM-DD`。时间线模式按它分组，热力图跳转也用它比对。
+ *
+ * ⚠️★ 不用 `toISOString()`：那给的是 **UTC** 日，会把本地晚上的条目算到第二天 ——
+ * 而服务端是按**本地日**分桶的（服务端 stats 那一份），两边对不上就会「跳错一天」，
+ * 而且**不报错**。
+ *
+ * ⚠️ 这是**全站唯一**实现：标准模式的热力图跳转与时间线模式的按日分组必须用同一个答案。
+ */
+export function localDateKey(timestamp?: number): string {
+    if (!timestamp) return '';
+    const date = new Date(timestamp * 1000);
+    return `${date.getFullYear()}-${pad2(date.getMonth() + 1)}-${pad2(date.getDate())}`;
+}
+
+/**
+ * 构建不带房间密码的绝对 URL。
+ * 分享/下载鉴权应使用服务端签发的短期 token（?t=），而不是 ?auth= 房间密码。
+ */
+export function buildCleanAbsoluteRouteUrl(path: string, prefix = ''): string {
+    const normalizedPath = String(path || '').replace(/^\/+/, '');
+    return new URL(`${prefix}/${normalizedPath}`, `${window.location.origin}/`).toString();
+}
+
+/**
+ * 应用内**静态资源**的绝对地址：相对「应用基准目录」而不是相对 `config.server.prefix`。
+ *
+ * ⚠️★ `config.server.prefix` **只能从 WebSocket 握手的 `config` 事件拿到**，所以在
+ * 「应用还没连上」的那一刻它是空串。任何**在那一刻就要用**的地址都不能依赖它 ——
+ * 否则拼出来是 `/shortcuts/meta.json`，而 `/clip` 部署下正确地址是
+ * `/clip/shortcuts/meta.json` → **404**，而且往往还被 `catch` 吞掉，只表现为
+ * 「某块内容静默不见了」。
+ */
+export function buildAppUrl(path: string): string {
+    return new URL(String(path || '').replace(/^\/+/, ''), APP_BASE_URL).href;
+}
+
+/**
+ * 从地址里读一个 query 参数。**开局读一次**用（store 的初值），不订阅后续变化。
+ *
+ * 这个 app 是 **history 路由**，参数就在 search 里（`http://host/?mode=board`）——
+ * 外部链接、书签、站内切换都是这一种写法。fragment 不参与（老 hash 地址已不兼容）。
+ *
+ * 为什么不用 `useSearchParams()`：store 的初值要在**第一次渲染之前**定下来，
+ * 而路由解析是异步的 —— 那时候定不了，会先按旧值渲染一帧再跳，模式差异大的话就是一次可见的闪烁。
+ */
+export function readLocationParam(key: string): string {
+    const name = String(key || '');
+    if (!name || typeof window === 'undefined') {
+        return '';
+    }
+    return new URLSearchParams(window.location.search).get(name) || '';
+}
+
+export function copyTextToClipboard(textToCopy: string): Promise<void> {
+    if (navigator.clipboard && window.isSecureContext) {
+        return navigator.clipboard.writeText(textToCopy);
+    }
+    return new Promise((resolve, reject) => {
+        try {
+            const textArea = document.createElement('textarea');
+            textArea.value = textToCopy;
+            textArea.style.position = 'absolute';
+            textArea.style.left = '-9999px';
+            document.body.appendChild(textArea);
+            textArea.select();
+            const successful = document.execCommand('copy');
+            document.body.removeChild(textArea);
+            if (successful) {
+                resolve();
+            } else {
+                reject(new Error('execCommand copy failed'));
+            }
+        } catch (err) {
+            reject(err);
+        }
+    });
+}
+
+const CLIENT_ID_KEY = 'ccgDeviceId';
+
+export function getClientId(): string {
+    try {
+        let id = localStorage.getItem(CLIENT_ID_KEY);
+        if (!id) {
+            id = (globalThis.crypto && typeof crypto.randomUUID === 'function')
+                ? crypto.randomUUID()
+                : `ccg-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+            localStorage.setItem(CLIENT_ID_KEY, id);
+        }
+        return id;
+    } catch {
+        return '';
+    }
+}
+
+export interface SenderDevice {
+    name?: string;
+    os?: string;
+    type?: string;
+}
+
+// 设备显示名：客户端声明的 name 优先，没有才回落 UA 推断出的 os / type。
+export function deviceLabel(senderDevice?: SenderDevice | null, fallback = ''): string {
+    if (!senderDevice) {
+        return fallback;
+    }
+    return senderDevice.name || senderDevice.os || senderDevice.type || fallback;
+}
+
+/**
+ * 这条消息是不是**定时任务**发的。
+ * 服务端在 `deliverMessage` 里给定时投递的消息打上 `source: 'automation'`，人发的该字段为空。
+ *
+ * ⚠️ 判定**只写这一处**。各模式的呈现方式不同，但「是不是定时消息」必须是同一个答案。
+ */
+export function isAutomationMessage(meta?: { source?: string } | null): boolean {
+    return meta?.source === 'automation';
+}
+
+/** 这条定时消息是不是「错过触发窗口后补发」的（服务端只在超出补发窗口时才置 `late`）。 */
+export function isLateMessage(meta?: { late?: boolean } | null): boolean {
+    return Boolean(meta?.late);
+}
+
+/**
+ * 从 axios 错误里取出「给人看」的文案。
+ * 服务端统一返回 { code, error, message }：message 是中文人话，error 是英文人话。
+ * 优先用 message，退回 error。纯文本/HTML 就截断后原样兜出来 —— 总比只显示一句泛化的「失败」强。
+ */
+export function errorMessage(error: unknown): string {
+    const data = (error as { response?: { data?: unknown } } | null)?.response?.data;
+    if (!data) return '';
+    if (typeof data === 'string') return data.trim().slice(0, 200);
+    const obj = data as { message?: unknown; error?: unknown };
+    return String(obj.message || obj.error || '');
+}
+
+/**
+ * 这条内容**默认**该看渲染视图，还是原文。
+ *
+ * 这是「默认值」的**唯一**判断处，标准模式卡片、便签阅读器、速览预览、看板卡片都走它 ——
+ * 各写一套的话，同一条内容在不同界面里长相不同，用户没法预期。
+ * 规则：任务列表、表格、**含代码标记的**（``` 围栏或行内 `` `x` ``）、**含公式的**（`$…$` / `$$…$$`）
+ * 默认渲染，其余默认原文。
+ *
+ * ⚠️ 代码那条是 2026-10-30 加的，Jonny 的要求。理由和任务列表一样：代码块贴进来一片黑白
+ * （或没上色的等宽），而「点一下 Markdown 渲染」这个动作对读者是隐藏的 —— 贴代码的人
+ * 预期对方**直接看见**语法高亮，不是看见一坨原文。判据 `hasCodeMarkup`。
+ * ⚠️ 公式同理（同一天补的）：`$E=mc^2$` 的原文比没上色的代码更没法读，而这个功能藏在
+ * 「更多动作」里等于没有。判据 `hasMathMarkup` —— 它和 tokenizer 用的是**同一套**边界规则，
+ * 所以 `苹果 $5，香蕉 $3`、`$HOME 和 $PATH` 不会被误判成公式。
+ */
+export function prefersRenderedView(text: string): boolean {
+    return Boolean(
+        looksLikeTaskList(text) || looksLikeTable(text) || hasCodeMarkup(text) || hasMathMarkup(text),
+    );
+}
+
+/**
+ * 翻转第 `index` 个任务列表项（`- [ ]` ↔ `- [x]`），返回新文本。
+ * 按**渲染顺序**数，和页面上复选框的顺序一一对应。越界就原样返回，不抛错。
+ */
+export function toggleTaskListItem(text: string, index: number): string {
+    let seen = 0;
+    return String(text || '').replace(
+        /(^|\n)(\s{0,3}(?:[-*+]|\d+\.)\s+\[)([ xX])(\])/g,
+        (match, lead, prefix, mark, close) => {
+            if (seen++ !== index) return match;
+            return lead + prefix + (mark === ' ' ? 'x' : ' ') + close;
+        },
+    );
+}
+
+// 文件名是不是图片。**全站唯一实现** —— 判型只看扩展名，不看内容：
+// 服务端不嗅探、客户端也不该嗅探，两边同一套标准。
+const IMAGE_NAME_RE = /\.(png|jpe?g|gif|webp|svg|bmp|ico|avif)$/i;
+export function isImageName(name?: string): boolean {
+    return IMAGE_NAME_RE.test(String(name || ''));
+}
+
+/**
+ * 这条条目是不是「文件」类 —— **全站唯一实现**。⚠️★ 判据是 **`type !== 'text'`**，
+ * **不是** `type === 'file'`。
+ *
+ * 为什么不能写 `=== 'file'`（两个独立的坑，任一个都够把所有图片干趴下）：
+ *
+ * ① **`type` 是 MIME 派生的，不是 `file`。** 服务端 `determine_response_type()`
+ *    （`handlers.rs`，对应 Go `utils.go:199`）按扩展名给 `type` 赋
+ *    `image` / `audio` / `video` / `document` / `archive` / `file` ——
+ *    只有「猜不出 MIME」的才是 `file`。所以 `.png` 条目的 `type` 是 `image`。
+ *    见 fixture `cases/protocol/content_entry_file.json`（`screenshot.png` → `"type":"image"`）。
+ *
+ * ② **同一个条目在两条链路上的 `type` 并不相同。** WS `receive` 事件发的是**入库时的**
+ *    `type`（永远是 `text` / `file`，见 `post_event_file.json`），而历史接口
+ *    （`/content`、`/content/latest`）走 `content_entry()`，发的是上面那个 **MIME 类型**。
+ *    于是 `=== 'file'` 的表现是：**刚上传时正常，一刷新就坏** —— 这种「刷新才坏」的
+ *    bug 最难查，因为刷新前一切正常。两个形状都是 Go 导出的 fixture，都是既有契约，
+ *    所以修在**客户端**，别去动线上形状（Android / 桌面端 / Worker 都在读）。
+ *
+ * 判据与服务端自己的判别（`ReceiveHolder`：`text` vs 其余）、以及标准模式的卡片分发
+ * （`type === 'text' ? ReceivedText : ReceivedFile`）完全一致 —— 三处同一个语义。
+ *
+ * 认不出 `type`（空）时**当文本**：那是「宁可少渲染一个文件卡片，也别把正文当文件名」
+ * 的方向，也与改动前的行为一致。
+ */
+export function isFileEntry(item?: { type?: unknown } | null): boolean {
+    const type = String(item?.type ?? '').trim();
+    return type !== '' && type !== 'text';
+}
+
+// 文件条目「能不能就地预览、该按哪一类渲染」—— **全站唯一实现**。
+// 返回 `'image' | 'video' | 'audio' | 'text'`，不预览时返回 `''`（调用方退回图标）。
+const VIDEO_NAME_RE = /\.(mp4|webm|ogv|mov)$/i;
+const AUDIO_NAME_RE = /\.(mp3|wav|ogg|opus|m4a|flac)$/i;
+const TEXT_NAME_RE = /\.(txt|text|md|markdown|json|log|csv|tsv|ya?ml|xml|ini|conf|cfg|toml|properties|env|gitignore|dockerfile|js|jsx|mjs|cjs|ts|tsx|vue|css|scss|sass|less|html|htm|sql|sh|bash|zsh|fish|ps1|bat|cmd|go|py|java|kt|kts|rb|php|rs|c|cc|cpp|cxx|h|hh|hpp|hxx|swift|proto)$/i;
+
+export type FilePreviewKind = 'image' | 'video' | 'audio' | 'text' | '';
+
+export function filePreviewKind(name?: string): FilePreviewKind {
+    const value = String(name || '');
+    if (!value) {
+        return '';
+    }
+    if (isImageName(value)) {
+        return 'image';
+    }
+    if (VIDEO_NAME_RE.test(value)) {
+        return 'video';
+    }
+    if (AUDIO_NAME_RE.test(value)) {
+        return 'audio';
+    }
+    if (TEXT_NAME_RE.test(value)) {
+        return 'text';
+    }
+    return '';
+}
