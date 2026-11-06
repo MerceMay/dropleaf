@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
-  <!-- Paste logo: two stacked sheets, the top one with a folded corner. -->
+  <!-- DropLeaf logo: two stacked sheets, the top one with a folded corner. -->
   <!-- Back sheet (accent) peeking up-right behind the front sheet. -->
   <rect x="20" y="4" width="40" height="40" rx="7" fill="#f2572b"/>
   <!-- Front sheet (warm white) with its top-right corner cut for the fold. -->

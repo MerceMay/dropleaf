@@ -40,7 +40,7 @@ export default defineConfig(({ command }) => {
                 // ⚠️★ 这里列的东西会**绕过 `globIgnores` 直接进预缓存**（vite-plugin-pwa 把它们
                 //    单独塞进 manifest）。所以「预缓存瘦身」既要改 `globIgnores`，也要看这份清单。
                 //    ⚠️ 图标（favicon / pwa-* / apple-touch）必须留着：离线可用与主屏安装都靠它们。
-                includeAssets: ['favicon.svg', 'favicon-32.png', 'apple-touch-icon.png', 'pwa-192x192.png', 'pwa-512x512.png'],
+                includeAssets: ['favicon.svg', 'favicon-32.png', 'apple-touch-icon.png', 'pwa-192x192.png', 'pwa-512x512.png', 'pwa-maskable-512x512.png'],
                 manifest: {
                     name: 'DropLeaf',
                     short_name: 'DropLeaf',
@@ -55,7 +55,7 @@ export default defineConfig(({ command }) => {
                     icons: [
                         { src: 'pwa-192x192.png', sizes: '192x192', type: 'image/png' },
                         { src: 'pwa-512x512.png', sizes: '512x512', type: 'image/png' },
-                        { src: 'pwa-512x512.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' },
+                        { src: 'pwa-maskable-512x512.png', sizes: '512x512', type: 'image/png', purpose: 'maskable' },
                     ],
                 },
                 workbox: {
